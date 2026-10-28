@@ -22,3 +22,8 @@ Thumbs.db
 .idea/
 .vscode/
 .zcode/
+
+# Local agent tooling
+.pi/
+.serena/
+.playwright-mcp/
