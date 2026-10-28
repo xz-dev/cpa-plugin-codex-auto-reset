@@ -1,152 +1,32 @@
 # Codex Auto Reset
 
-`codex-auto-reset` is a CLIProxyAPI (CPA) dynamic library plugin that
-automatically redeems the soonest-expiring Codex "Reset Bank" credit on each
-enabled account before it expires, so no credit is ever lost to forgetfulness.
+`codex-auto-reset` is a CLIProxyAPI (CPA) dynamic library plugin that redeems Codex "Reset Bank" credits for you, so a credit is not lost because nobody redeemed it before it expired.
 
-Codex/ChatGPT accounts accumulate rate-limit reset credits that a user can
-manually redeem to reset their weekly rate-limit window. These credits expire,
-and the expiry window is easy to miss. This plugin watches each enabled
-account and redeems the credit a configurable amount of time before it would
-otherwise expire.
+Codex/ChatGPT accounts collect rate-limit reset credits. Each credit resets the weekly rate-limit window once, and each one expires. The plugin watches the accounts you enable and redeems the soonest-expiring credit shortly before it expires. Optionally, it can also redeem a credit as soon as an account's weekly quota is used up.
 
-The plugin is otherwise **independent of CPA's core behavior**. It does not
-participate in CPA's account selection, request routing, or circuit breaking.
-Its only dependency on CPA is reading account credentials via the host ABI,
-plus the standard plugin lifecycle and Management API surface.
+The plugin is independent of CPA's routing. It reads Codex credentials through the host ABI, talks to the ChatGPT backend directly, and after a verified reset asks CPA to clear that credential's routing cooldown.
 
-## How It Works
+## What it does
 
-For each enabled Codex account, the plugin runs a 6-state state machine:
+- **Account list.** Global defaults plus an enabled/disabled account list. Drag accounts (or use the buttons) to enable them. Each account can override the patrol interval, the lead time and the weekly-exhaustion option; overrides show the inherited global value as a hint, and Restore defaults removes them. No account is enabled by default.
+- **Expiry redemption.** Every patrol (default 1h) the plugin finds the soonest-expiring credit, pins its ID and expiry, and redeems exactly that credit at expiry minus the lead time (default 5m). It never substitutes another credit and never sends a request after the target has expired.
+- **Weekly-exhaustion redemption (opt-in, default off).** When enabled, a credit is redeemed only after a fresh, unrounded normal-weekly `used_percent >= 100`. Ordinary 429s, the 5-hour window, code-review limits and unknown usage never trigger it.
+- **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is still listed with status `redeemed`/`consumed`/`used` or a `redeemed_at` time. Success also needs the available count to drop by one and the weekly quota to recover.
+- **Automatic-spending hold.** If the outcome is unclear, automatic redemption for that account stops; patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a "consumed, recovery pending" attempt's quota recovers. **Redeem now** is the manual way out.
+- **Management page** in English and Chinese, reusing the Management Center's saved sign-in.
 
-```
-IDLE       → patrol every refresh_interval; if the soonest-expiring credit's
-             trigger window is within one interval, pin its ID and enter ARMED
-ARMED      → sleep directly to the trigger time T = expiry − trigger_lead_time
-             (no polling); on wake, enter CONFIRMING
-CONFIRMING → re-list credits; validate the pinned target is still available,
-             unexpired, and due; if early, re-arm the same ID at its fresh T;
-             otherwise fetch usage, mint a redeem_request_id, enter RESETTING
-RESETTING  → POST /consume with {redeem_request_id, credit_id}; on success
-             enter VERIFYING; on transient error retry (same idempotency key,
-             1/2/5/10/30 min backoff, max 5); on 4xx or no_credit stop
-VERIFYING  → after 1 min, re-list + fetch usage; triple deduction check
-             (target gone + count −1 + weekly recovered); enter DONE
-DONE       → cycle complete; back to IDLE
-```
-
-An automatic cycle never substitutes another credit if its pinned target
-is redeemed, removed, or expired, even if another credit is already due. A
-missing target ID also abandons the cycle. Credits with no expiry are never
-automatically redeemed; if the pinned target becomes non-expiring, that cycle
-is abandoned. The next IDLE patrol can schedule a new cycle normally.
-
-**Check** (including Check All) pulls only IDLE accounts to an immediate
-patrol; it never authorizes an early reset. Accounts inside an active cycle
-(armed, retrying, verifying) keep their schedule — confirmation still
-rechecks the target's current expiry and waits until its updated trigger
-time, so an early wake cannot bypass it. **Reset** explicitly requests immediate manual
-confirmation, clears the old automatic target, and selects the currently
-soonest-expiring available credit, even far before its trigger time (or with
-no expiry). It still runs the full confirm, consume, and verify flow. Repeated
-Reset requests during consume/retry or verification leave that active attempt
-intact. Returning to IDLE clears both the pinned target and manual intent.
-
-**Safety invariants** (covered by production tests and the simulation in `sim/`):
-
-1. **Serial per account.** Only one POST /consume is ever in flight per
-   account per cycle. All retries reuse the same target and
-   `redeem_request_id`, allowing OpenAI to deduplicate them.
-2. **Always targeted.** The consume body always carries `credit_id`. Automatic
-   confirmation validates the ID pinned when arming, not a newly selected
-   credit. Manual Reset explicitly selects a fresh available target.
-3. **Triple deduction check.** Verification requires (a) the target credit is
-   gone, (b) `available_count` decreased by exactly 1, AND (c) weekly quota
-   recovered. Any mismatch halts immediately — no compensating request is sent.
-
-## Privacy And Data Disclosure
-
-This plugin runs inside CPA and uses CPA-provided host callbacks plus
-plugin-owned CPA Management API routes. The browser resource page is only the
-UI surface. State-changing actions require the CPA Management key and are sent
-to `/v0/management/plugins/codex-auto-reset/...`. The page keeps that key only
-in the current browser page session and does not write it to plugin state,
-exports, logs, `localStorage`, or `sessionStorage`. The plugin does not run an
-external service and does not send data to the plugin author.
-
-The plugin sends authenticated requests to the ChatGPT backend to read quota
-state and consume reset credits:
-
-```text
-GET  https://chatgpt.com/backend-api/wham/usage
-GET  https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
-POST https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume
-```
-
-These requests use the Codex credentials already configured in CPA. The plugin
-uses the responses to calculate reset-credit expiry, target the soonest-expiring
-credit, and verify the reset took effect.
-
-After a reset is verified, the plugin also asks CPA's host API to clear that
-credential's core routing cooldown (`host.routing.reset_cooldown`). Redeeming a
-credit resets the upstream windows, but CPA may still hold the credential in
-cooldown until the old 429's `next_retry_after`; without this step the account
-looks recovered in the UI while every request keeps failing at the router. The
-call is best-effort: older hosts that do not expose the callback log a warning
-and the verified reset still stands.
-
-### State Storage And Durability
-
-The plugin persists its state file (`state.json`) — the user config fields,
-per-account FSM state, reset history, and recent log entries — at the first
-available location below (resolved once at startup, with one-time forward
-migration from older locations; superseded files are kept as `.migrated`):
-
-1. `state_dir` from the plugin's `config_yaml` block (operator override,
-   must be an absolute path)
-2. `<CPA auth dir>/plugin-state/codex-auto-reset/state.json` — derived from
-   the auth file paths reported by the host. **Recommended and default**: in
-   container deployments the auth dir is the tree operators volume-mount, so
-   state survives CPA image updates and container recreates.
-3. `<OS user config dir>/CLIProxyAPI/codex-auto-reset/state.json` — fallback
-   (Windows `%APPDATA%`, Linux `~/.config`). **Ephemeral inside containers**
-   unless that path is volume-mounted.
-
-The plugin also keeps a one-generation backup (`state.json.bak`, refreshed on
-every successful load) and, if the main file is ever corrupt, quarantines the
-original bytes as `state.json.corrupt-<timestamp>` before recovering from the
-backup — state is never silently destroyed.
-
-Docker note: with the default auth-dir location, mounting your auth dir (you
-already must, for credentials) is enough, e.g.
-`-v ./cpa/auths:/root/.cli-proxy-api`. No access tokens or credential
-material are persisted in the state file.
+Details on every state, retry rule and safety rule are in [docs/reference.md](docs/reference.md).
 
 ## Installation
 
-Download the zip for your platform from the latest GitHub release:
-
-```text
-codex-auto-reset_<version>_<goos>_<goarch>.zip
-```
-
-Extract the dynamic library and place it in CPA's plugin directory for your
-platform. The zip contains the library at the archive root:
-
-- macOS: `codex-auto-reset.dylib`
-- Linux: `codex-auto-reset.so`
-- Windows: `codex-auto-reset.dll`
-
-Example:
+Download `codex-auto-reset_<version>_<goos>_<goarch>.zip` from the GitHub release and copy the library into CPA's plugin directory for your platform, for example:
 
 ```bash
-mkdir -p /path/to/CLIProxyAPI/plugins/darwin/arm64
-cp codex-auto-reset.dylib /path/to/CLIProxyAPI/plugins/darwin/arm64/
+mkdir -p /path/to/CLIProxyAPI/plugins/linux/amd64
+cp codex-auto-reset.so /path/to/CLIProxyAPI/plugins/linux/amd64/
 ```
 
-## CPA Configuration
-
-Enable global plugins and this plugin in CPA:
+The library must be built against a glibc no newer than the one in the CPA runtime (the official CPA image is Debian bookworm, glibc 2.36). Then enable it in CPA's `config.yaml` and restart CPA:
 
 ```yaml
 plugins:
@@ -157,146 +37,58 @@ plugins:
       priority: 1
 ```
 
-The plugin reads its 3 user-tunable fields from `config_yaml`:
+Keep only one version of the plugin in the plugin directory.
+
+## Usage
+
+Open the page from CPA's plugin resources, or go to `/v0/resource/plugins/codex-auto-reset/status`. It also works behind a path prefix such as `/cpa/v0/resource/...`.
+
+Sign in to the Management Center with "remember password" first; the page reuses that saved login for the same CPA instance and shows guidance if it is missing or rejected. Then:
+
+1. Set the global defaults. Durations take a number plus a minute/hour unit; anything under 1 minute is rejected.
+2. Move the accounts you want into the enabled list.
+3. Override per-account values where needed and save each row.
+
+**Check now** runs an immediate read-only patrol under the normal policy. **Redeem now** asks for confirmation and then redeems the soonest-expiring credit right away. The page refreshes saved status every 15 seconds and never queries upstream on its own.
+
+Settings can also be given in the plugin's `config_yaml`; values saved from the page take precedence:
 
 ```yaml
-refresh_interval: 12h        # IDLE patrol cadence (default 12h)
-trigger_lead_time: 6h        # redeem this long before a credit expires (default 6h)
-enabled_accounts:            # subset of Codex account auth_indexes (default: none)
-  - auth_index_1
-  - auth_index_2
-state_dir: /absolute/path    # optional operator override for the state file
-                             # location (see State Storage And Durability)
+refresh_interval: 1h                    # patrol interval
+trigger_lead_time: 5m                   # redeem this long before expiry
+auto_reset_on_weekly_exhaustion: false  # global default
+enabled_accounts: [auth_index_1]
+account_overrides:
+  auth_index_1:
+    trigger_lead_time: 10m
+    auto_reset_on_weekly_exhaustion: true
+state_dir: /absolute/path               # optional state location override
 ```
 
-All other behavior (OpenAI endpoints, retry backoff, post-reset verify delay,
-log retention) is hardcoded and not user-configurable.
-
-## Management UI
-
-Open the resource page from CPA's plugin resources, or visit:
-
-```text
-/v0/resource/plugins/codex-auto-reset/status
-```
-
-The page derives its Management API root from the loaded page URL, so it also
-works when CPA is exposed under a reverse-proxy path prefix (for example
-`/cpa/v0/resource/plugins/codex-auto-reset/status` calls
-`/cpa/v0/management/plugins/codex-auto-reset/...`). Root deployments yield an
-empty prefix and keep using `/v0/management/...`.
-
-The page follows the browser language by default and can be switched between
-English and Chinese manually. It provides:
-
-- The 3 user config fields (editable, saved via the Management key).
-- Per-account cards showing FSM state, credits available, weekly remaining,
-  and manual Check / Reset buttons.
-- A live log view (last 100 entries).
-- A live countdown to each account's next scheduled action.
-
-The resource page asks for the CPA Management key before it performs protected
-actions. This follows CPA's security boundary: `/v0/resource/plugins/...`
-serves the browser resource page, while `/v0/management/...` handles
-authenticated management operations.
-
-## Management API
-
-```
-GET  /v0/resource/plugins/codex-auto-reset/status            # resource page (read-only HTML)
-GET  /v0/management/plugins/codex-auto-reset/status          # JSON status (config + accounts)
-GET  /v0/management/plugins/codex-auto-reset/logs            # recent log entries
-PUT  /v0/management/plugins/codex-auto-reset/settings        # update the 3 config fields
-POST /v0/management/plugins/codex-auto-reset/check           # manual check; body {auth_index}
-POST /v0/management/plugins/codex-auto-reset/check/all       # manual check all accounts
-POST /v0/management/plugins/codex-auto-reset/reset           # manual reset; body {auth_index}
-GET  /v0/management/plugins/codex-auto-reset/export          # export state JSON
-POST /v0/management/plugins/codex-auto-reset/import          # import state JSON
-```
-
-All `/v0/management/...` routes require the CPA Management key.
+By default state lives in `<CPA auth dir>/plugin-state/codex-auto-reset/state.data`, which survives container recreates. It holds no tokens.
 
 ## Build
 
-Requirements:
-
-- Go 1.26 or newer, as declared by `go.mod`.
-- CGO support.
-- A C compiler for `-buildmode=c-shared` (MinGW-w64 on Windows, gcc/clang on
-  Linux/macOS).
-- `make` for the cross-platform release workflow (optional — direct `go
-  build` works too).
-
-Run tests:
+Requirements: Go 1.26+, CGO and a C compiler.
 
 ```bash
 make test
+make build                  # dist/codex-auto-reset.so (or .dylib/.dll)
+make package VERSION=0.2.0  # release zip
 ```
 
-Build the dynamic library for the current platform:
+For a Linux library that loads in the official CPA image, build inside a matching base, for example:
 
 ```bash
-make build
+docker run --rm -v "$PWD":/src -w /src golang:1.26-bookworm make build VERSION=0.2.0
 ```
 
-Build and package the release zip:
+Pushing a `v*` tag builds release assets on GitHub Actions. `sim/` holds a deterministic simulation of the redemption state machine (`cd sim && go test ./...`).
 
-```bash
-make package VERSION=0.1.0
-```
+## Background
 
-Windows users can also use the PowerShell helper:
-
-```powershell
-.\build.ps1
-```
-
-The PowerShell script builds `dist/codex-auto-reset.dll` and requires a C
-compiler such as MinGW-w64 on `PATH`.
-
-## GitHub Releases
-
-GitHub Actions builds release assets when a tag matching `v*` is pushed. Use
-a dotted numeric version tag such as:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The `Build` workflow runs tests and creates the release automatically. Release
-assets are named:
-
-```text
-codex-auto-reset_<version>_<goos>_<goarch>.zip
-checksums.txt
-```
-
-## Manual Verification Checklist
-
-Before relying on this plugin in production, verify against real OpenAI:
-
-- [ ] The resource page renders and the language switcher works.
-- [ ] Saving settings round-trips through the state file.
-- [ ] The manual Check button produces a log line for the target account.
-- [ ] A real GET to `/rate-limit-reset-credits` returns the credit list.
-- [ ] A real POST to `/consume` with `{redeem_request_id, credit_id}` returns
-      `code=reset` and the target credit disappears.
-- [ ] Reusing the same `redeem_request_id` returns `code=already_redeemed`
-      (idempotent success).
-- [ ] After a successful reset, the weekly quota recovers to 100%.
-- [ ] Deferral: after a manual Check in IDLE with no imminent credit, the next
-      patrol is `refresh_interval` from the manual check's completion time.
-- [ ] Check while ARMED neither pulls the trigger wake forward nor consumes
-      before the pinned target's trigger time.
-- [ ] Redeeming the pinned target externally while ARMED abandons that cycle
-      without consuming a different credit.
-
-Real-credit verification is necessarily infrequent (credits are scarce and
-expire over weeks). The `sim/` directory contains a deterministic event-driven
-simulation that validated the FSM design across 231 tests before any production
-code was written; run `cd sim && go test ./...` to re-verify the design.
+CPA routes requests across many Codex accounts, and each account's reset credits expire on their own schedule. Redeeming them by hand is easy to forget, and redeeming the wrong credit, or redeeming twice, wastes credits. The plugin therefore spends only when a rule allows it, always names the exact credit, and stops automatic spending whenever it cannot prove what happened.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
