@@ -142,18 +142,18 @@ jobs:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
           dir: .
-          packages: .
+          packages: ./cmd/codex-auto-reset
           targets: windows-arm64
           out-dir: dist/windows-arm64
           output: ${{ env.PLUGIN_NAME }}.dll
           flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+          x-flags: github.com/xz-dev/cpa-plugin-codex-auto-reset/internal/plugin.pluginVersion=${{ steps.release_metadata.outputs.version }}
 
       - name: Package plugin
         run: |
           set -euo pipefail
           rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_NAME}.h"
-          go run ./.github/scripts/package-release.go \
+          go run ./scripts/package-release \
             -library "dist/windows-arm64/${PLUGIN_NAME}.dll" \
             -archive "dist/${ARCHIVE_NAME}" \
             -checksum "dist/${ARCHIVE_NAME}.sha256"
@@ -209,18 +209,18 @@ jobs:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
           dir: .
-          packages: .
+          packages: ./cmd/codex-auto-reset
           targets: freebsd-amd64
           out-dir: dist/freebsd-amd64
           output: ${{ env.PLUGIN_NAME }}.so
           flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+          x-flags: github.com/xz-dev/cpa-plugin-codex-auto-reset/internal/plugin.pluginVersion=${{ steps.release_metadata.outputs.version }}
 
       - name: Package plugin
         run: |
           set -euo pipefail
           rm -f go-cross-bin.h "dist/freebsd-amd64/${PLUGIN_NAME}.h"
-          go run ./.github/scripts/package-release.go \
+          go run ./scripts/package-release \
             -library "dist/freebsd-amd64/${PLUGIN_NAME}.so" \
             -archive "dist/${ARCHIVE_NAME}" \
             -checksum "dist/${ARCHIVE_NAME}.sha256"

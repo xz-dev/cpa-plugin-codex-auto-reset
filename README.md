@@ -83,7 +83,15 @@ For a Linux library that loads in the official CPA image, build inside a matchin
 docker run --rm -v "$PWD":/src -w /src golang:1.26-bookworm make build VERSION=0.2.0
 ```
 
-Pushing a `v*` tag builds release assets on GitHub Actions. `sim/` holds a deterministic simulation of the redemption state machine (`cd sim && go test ./...`).
+On Windows, `scripts/build.ps1` builds `dist/codex-auto-reset.dll`. Pushing a `v*` tag builds release assets on GitHub Actions.
+
+Repository layout:
+
+- `cmd/codex-auto-reset/` — the C ABI entry point (cgo glue only)
+- `internal/plugin/` — the plugin: state machine, worker, OpenAI client, management API and page
+- `internal/sim/` — deterministic simulation of the redemption state machine
+- `scripts/` — release packaging and the Windows build script
+- `docs/` — [reference](docs/reference.md) and archived history; `openspec/` — current specs and archived changes
 
 ## Background
 

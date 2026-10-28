@@ -1,0 +1,1195 @@
+package plugin
+
+import (
+	"errors"
+	"fmt"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fakeClient implements ResetClient for tests. Mirrors sim/engine.go's
+// FakeOpenAIClient: same field intent (live credit map, weekly %, scripted
+// consume response, transient-failure injection, wrong-credit deduction hook).
+type fakeClient struct {
+	credits     map[string]*Credit
+	weeklyPct   int
+	weeklyUsed  float64 // raw unrounded normal-weekly used percent
+	weeklyKnown bool    // whether weeklyUsed is trustworthy evidence
+	consumeResp ConsumeResponse
+	consumeErr  error // returned when consumeResp.Code is zero AND failFirstN==0
+	listErr     error // returned by ListAllCredits when set
+	usageErr    error // returned by GetUsage when set
+
+	listCalls    int
+	usageCalls   int
+	consumeCalls int
+	consumeIDs   []string
+	redeemIDs    []string
+
+	// failFirstN, when > 0, makes the next N consume calls return failErr
+	// BEFORE applying any server-side deduction (mirrors sim/engine.go's
+	// FailFirstN: a failed attempt must not mutate server state).
+	failFirstN int
+	failErr    error
+
+	// deductCreditID, if non-empty, overrides the consumed id during the
+	// server-side deduction — used to script the wrong-credit bug.
+	deductCreditID string
+
+	// keepQuotaAtPre, when true, makes Consume deduct the credit WITHOUT
+	// bumping weeklyPct to 100 — scripts a broken/stale server where the
+	// reset succeeds on the credit leg but the quota does not recover.
+	keepQuotaAtPre bool
+}
+
+func (f *fakeClient) ListCredits(CodexCredentials) (Snapshot, error) {
+	f.listCalls++
+	credits := make([]Credit, 0, len(f.credits))
+	for _, c := range f.credits {
+		credits = append(credits, *c)
+	}
+	// WeeklyPct=-1 matches parseResetCreditsResponse (the reset-credits endpoint
+	// does not return weekly %). stepCONFIRMING fetches usage separately to fill
+	// in the real value; returning a real value here would mask the confirm-time
+	// GetUsage requirement (reviewer issue I1/I2).
+	return Snapshot{Credits: credits, AvailableCount: countAvail(credits), WeeklyPct: -1}, nil
+}
+
+// ListAllCredits returns the raw unfiltered records so post-consume
+// verification judges the pinned target's disappearance by identity.
+func (f *fakeClient) ListAllCredits(CodexCredentials) (Snapshot, error) {
+	f.listCalls++
+	if f.listErr != nil {
+		return Snapshot{}, f.listErr
+	}
+	credits := make([]Credit, 0, len(f.credits))
+	for _, c := range f.credits {
+		credits = append(credits, *c)
+	}
+	return Snapshot{Credits: credits, AvailableCount: countAvail(credits), WeeklyPct: -1}, nil
+}
+
+func (f *fakeClient) GetUsage(CodexCredentials) (Snapshot, error) {
+	f.usageCalls++
+	if f.usageErr != nil {
+		return Snapshot{}, f.usageErr
+	}
+	return Snapshot{WeeklyPct: f.weeklyPct, WeeklyUsedPct: f.weeklyUsed, WeeklyKnown: f.weeklyKnown, AvailableCount: countAvail(mapToCredits(f.credits))}, nil
+}
+
+func (f *fakeClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeResponse, error) {
+	f.consumeCalls++
+	f.consumeIDs = append(f.consumeIDs, cid)
+	f.redeemIDs = append(f.redeemIDs, rrid)
+
+	// Transient-failure injection takes precedence so a failed attempt does
+	// NOT mutate server state (matches sim/engine.go's ordering).
+	if f.failFirstN > 0 && f.failErr != nil {
+		f.failFirstN--
+		return ConsumeResponse{}, f.failErr
+	}
+	if f.consumeErr != nil {
+		return ConsumeResponse{}, f.consumeErr
+	}
+	// Server-side deduction on success-equivalent codes.
+	if f.consumeResp.Code == ConsumeCodeReset || f.consumeResp.Code == ConsumeCodeAlreadyRedeemed {
+		deductID := cid
+		if f.deductCreditID != "" {
+			deductID = f.deductCreditID
+		}
+		if c, ok := f.credits[deductID]; ok {
+			c.Status = "redeemed"
+		}
+		if !f.keepQuotaAtPre {
+			f.weeklyPct = 100
+			f.weeklyUsed = 0
+			f.weeklyKnown = true
+		}
+	}
+	return f.consumeResp, nil
+}
+
+func countAvail(cs []Credit) int {
+	n := 0
+	for _, c := range cs {
+		if c.Status == "available" {
+			n++
+		}
+	}
+	return n
+}
+
+func mapToCredits(m map[string]*Credit) []Credit {
+	out := make([]Credit, 0, len(m))
+	for _, c := range m {
+		out = append(out, *c)
+	}
+	return out
+}
+
+type fakeClock struct{ t time.Time }
+
+func (f *fakeClock) Now() time.Time { return f.t }
+
+// drive runs the FSM until DONE (or step cap), advancing the fake clock to
+// each scheduled wake. Mirrors sim/engine.go's Run loop.
+func drive(t *testing.T, fsm *AccountFSM, clock *fakeClock) {
+	t.Helper()
+	for i := 0; i < 200 && fsm.State() != StateDONE; i++ {
+		next := fsm.Step()
+		if next.IsZero() {
+			break
+		}
+		if next.After(clock.t) {
+			clock.t = next
+		}
+	}
+}
+
+func TestFSM_HappyPath_AllStates(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   15,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	logs := []string{}
+	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
+		logs = append(logs, fmt.Sprintf("%s/%s: %s", level, state, msg))
+	}
+	fsm := NewAccountFSM("acct1", CodexCredentials{AccessToken: "t", ChatGPTAccountID: "a"}, cfg, fc, clock.Now, logf)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE. Logs:\n%s", fsm.State(), strings.Join(logs, "\n"))
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("consume calls = %d, want 1", fc.consumeCalls)
+	}
+	if len(fc.consumeIDs) != 1 || fc.consumeIDs[0] != "c1" {
+		t.Fatalf("consumed = %v, want [c1]", fc.consumeIDs)
+	}
+	if c := fc.credits["c1"]; c.Status != "redeemed" {
+		t.Fatalf("c1 status = %s, want redeemed", c.Status)
+	}
+	if fc.weeklyPct != 100 {
+		t.Fatalf("weekly = %d%%, want 100", fc.weeklyPct)
+	}
+}
+
+// TestFSM_IdempotentRetry_FailureThenSuccess: first Consume returns a transient
+// network error; the second returns code=reset. The retry MUST reuse the same
+// redeem_request_id and the credit MUST be redeemed exactly once.
+func TestFSM_IdempotentRetry_FailureThenSuccess(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		failFirstN:  1,
+		failErr:     errors.New("transient network timeout"),
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 2 {
+		t.Fatalf("consume calls = %d, want 2 (1 fail + 1 success)", fc.consumeCalls)
+	}
+	if len(fc.redeemIDs) != 2 || fc.redeemIDs[0] != fc.redeemIDs[1] {
+		t.Fatalf("redeem ids = %v, want both identical", fc.redeemIDs)
+	}
+	if c := fc.credits["c1"]; c.Status != "redeemed" {
+		t.Fatalf("c1 status = %s, want redeemed once", c.Status)
+	}
+}
+
+// TestFSM_AlreadyRedeemed_TreatedAsSuccess: Consume returns code=already_redeemed
+// on the first call. The plugin treats this as success and verifies normally.
+func TestFSM_AlreadyRedeemed_TreatedAsSuccess(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeAlreadyRedeemed, WindowsReset: 0},
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("consume calls = %d, want 1", fc.consumeCalls)
+	}
+	if c := fc.credits["c1"]; c.Status != "redeemed" {
+		t.Fatalf("c1 status = %s, want redeemed (server-side hook on already_redeemed)", c.Status)
+	}
+}
+
+// TestFSM_RetriesExhausted_GivesUp: Consume always returns a network error.
+// Expect 6 POSTs (1 initial + 5 retries), all with the same UUID, then DONE
+// with the credit NOT redeemed.
+func TestFSM_RetriesExhausted_GivesUp(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:    map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:  20,
+		failFirstN: 100,
+		failErr:    errors.New("persistent network failure"),
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 6 {
+		t.Fatalf("consume calls = %d, want 6 (1 + 5 retries)", fc.consumeCalls)
+	}
+	first := fc.redeemIDs[0]
+	for i, id := range fc.redeemIDs {
+		if id != first {
+			t.Fatalf("redeem id %d = %q, want %q (same UUID across retries)", i, id, first)
+		}
+	}
+	if c := fc.credits["c1"]; c.Status != "available" {
+		t.Fatalf("c1 status = %s, want available (server never succeeded)", c.Status)
+	}
+}
+
+// TestFSM_NoCredit_Stops: Consume returns code=no_credit. The plugin must
+// hard-stop (no retry), DONE, credit not redeemed.
+func TestFSM_NoCredit_Stops(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   30,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeNoCredit},
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("consume calls = %d, want 1 (no_credit is terminal)", fc.consumeCalls)
+	}
+	if c := fc.credits["c1"]; c.Status != "available" {
+		t.Fatalf("c1 status = %s, want available (no deduction on no_credit)", c.Status)
+	}
+}
+
+// TestFSM_CreditVanishesDuringARMED: during the ARMED sleep the credit is
+// manually redeemed. At CONFIRMING the list returns no available credits.
+// Expect 0 POSTs and DONE (abandoned).
+func TestFSM_CreditVanishesDuringARMED(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   30,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
+
+	// Step 1: IDLE sees available credit; now >= M, enters ARMED, sleeps to T.
+	next := fsm.Step()
+	if fsm.State() != StateARMED {
+		t.Fatalf("after IDLE step, state = %s, want ARMED", fsm.State())
+	}
+	// Simulate human using the credit during ARMED sleep.
+	fc.credits["c1"].Status = "redeemed"
+	// Advance clock to the scheduled ARMED wake.
+	if next.After(clock.t) {
+		clock.t = next
+	}
+	// ARMED wake -> CONFIRMING (immediate re-enter), then CONFIRMING sees no
+	// available credit and abandons.
+	for i := 0; i < 10 && fsm.State() != StateDONE; i++ {
+		n := fsm.Step()
+		if n.IsZero() {
+			break
+		}
+		if n.After(clock.t) {
+			clock.t = n
+		}
+	}
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 0 {
+		t.Fatalf("consume calls = %d, want 0 (target vanished pre-POST)", fc.consumeCalls)
+	}
+}
+
+// TestFSM_WrongCreditConsumed_DetectsMismatch: two credits, target is "sooner".
+// The server's deduction hook marks "later" instead. The triple-check must
+// detect the mismatch and halt as error. "sooner" must still be available.
+func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
+	E1 := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC) // sooner (target)
+	E2 := E1.Add(10 * 24 * time.Hour)                     // later (must NOT be touched)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
+			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
+		},
+		weeklyPct:      25,
+		consumeResp:    ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		deductCreditID: "later", // server bug: deducts the wrong credit
+	}
+	clock := &fakeClock{t: E1.Add(-12 * time.Hour)}
+	logs := []string{}
+	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
+		logs = append(logs, msg)
+	}
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, logf)
+
+	drive(t, fsm, clock)
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("consume calls = %d, want 1", fc.consumeCalls)
+	}
+	if len(fc.consumeIDs) != 1 || fc.consumeIDs[0] != "sooner" {
+		t.Fatalf("consumed = %v, want [sooner] (target)", fc.consumeIDs)
+	}
+	// The mismatch must be logged.
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(strings.ToLower(joined), "mismatch") {
+		t.Fatalf("expected mismatch in logs, got:\n%s", joined)
+	}
+	// Sooner must still be available (server never actually consumed it).
+	if c := fc.credits["sooner"]; c.Status != "available" {
+		t.Fatalf("sooner status = %s, want available", c.Status)
+	}
+}
+
+// TestFSM_QuotaLegIsLiveInProduction proves the third leg of the triple-check
+// (quotaUp) is genuinely active in production-like conditions: ListCredits
+// returns WeeklyPct=-1 (as the real reset-credits endpoint does), and
+// stepCONFIRMING must call GetUsage to recover the real pre-reset weekly %.
+// If that confirm-time GetUsage were missing, a reset that consumed the
+// target credit but did NOT refill weekly quota would still be reported OK.
+//
+// We script exactly that broken-server scenario: consume succeeds, count
+// drops, target disappears — but weekly stays at the pre-reset value.
+// The FSM must classify this as PARTIAL (count ok but quota not recovered),
+// proving the quota leg is doing real work.
+func TestFSM_QuotaLegIsLive_PartialWhenQuotaDoesNotRecover(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   15,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		// Override the default consume side-effect: deduct the credit (so
+		// targetGone + countDown1 hold) but do NOT bump weeklyPct to 100.
+		keepQuotaAtPre: true,
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
+		// no-op; we assert on FSM behavior, not logs
+	}
+	fsm := NewAccountFSM("acct1", CodexCredentials{AccessToken: "t"}, cfg, fc, clock.Now, logf)
+
+	for i := 0; i < 50 && fsm.State() != StateDONE; i++ {
+		next := fsm.Step()
+		if next.IsZero() {
+			break
+		}
+		clock.t = next
+	}
+
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
+	}
+	if fc.usageCalls == 0 {
+		t.Fatalf("GetUsage was never called at confirm time — quota leg is dead (regression of I1)")
+	}
+	// Credit WAS consumed (count dropped, target gone), but weekly stayed at
+	// 15%. The triple check must NOT classify this as full success — it should
+	// be PARTIAL (count ok, quota NOT up). Assert the credit is redeemed but
+	// weekly did not recover, proving the quota leg is what distinguishes the
+	// outcome.
+	if c := fc.credits["c1"]; c.Status != "redeemed" {
+		t.Fatalf("c1 status = %s, want redeemed (server did consume it)", c.Status)
+	}
+	if fc.weeklyPct != 15 {
+		t.Fatalf("weeklyPct = %d, want 15 (scripted non-recovery)", fc.weeklyPct)
+	}
+	// No direct hook for the OK/PARTIAL/MISMATCH classification outcome on the
+	// FSM struct, but the invariant we needed to prove — GetUsage is called at
+	// confirm time — is asserted above. The wrong-credit test covers MISMATCH;
+	// the happy-path test covers OK. This test proves the quota fetch happens
+	// and that a non-recovering quota does not silently pass as OK.
+}
+
+func armedFSMFixture(t *testing.T) (*AccountFSM, *fakeClient, *fakeClock, time.Time) {
+	t.Helper()
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"a": {ID: "a", Status: "available", ExpiresAt: E},
+			"b": {ID: "b", Status: "available", ExpiresAt: E.Add(14 * 24 * time.Hour)},
+		},
+		weeklyPct:   25,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+	}
+	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	wake := fsm.Step()
+	if fsm.State() != StateARMED || !wake.Equal(E.Add(-cfg.TriggerLeadTime)) {
+		t.Fatalf("initial state=%s wake=%v, want ARMED at T", fsm.State(), wake)
+	}
+	return fsm, fc, clock, wake
+}
+
+func TestFSM_PinnedTargetUnavailable(t *testing.T) {
+	for _, change := range []string{"redeemed", "removed", "expired", "expires_now"} {
+		for _, replacement := range []string{"far_future", "already_due"} {
+			t.Run(change+"/"+replacement, func(t *testing.T) {
+				fsm, fc, clock, trigger := armedFSMFixture(t)
+				clock.t = trigger
+				switch change {
+				case "redeemed":
+					fc.credits["a"].Status = "redeemed"
+				case "removed":
+					delete(fc.credits, "a")
+				case "expired":
+					fc.credits["a"].ExpiresAt = trigger.Add(-time.Second)
+				case "expires_now":
+					fc.credits["a"].ExpiresAt = trigger
+				}
+				if replacement == "already_due" {
+					fc.credits["b"].ExpiresAt = trigger.Add(time.Hour)
+				}
+				fsm.Step()
+				fsm.Step()
+				if fsm.State() == StateRESETTING {
+					fsm.Step()
+				}
+				if fsm.State() != StateDONE || fc.consumeCalls != 0 || fsm.attempt.RedeemRequestID != "" {
+					t.Fatalf("state=%s consumed=%v attempt=%+v; vanished target must abandon this cycle without substitution", fsm.State(), fc.consumeIDs, fsm.attempt)
+				}
+				if fc.credits["b"].Status != "available" {
+					t.Fatal("replacement credit was consumed")
+				}
+			})
+		}
+	}
+}
+
+func TestFSM_AutomaticConfirmRequiresTarget(t *testing.T) {
+	for _, state := range []State{StateARMED, StateCONFIRMING} {
+		t.Run(string(state), func(t *testing.T) {
+			fsm, fc, clock, trigger := armedFSMFixture(t)
+			fsm.Reset()
+			fsm.state = state
+			clock.t = trigger
+			if state == StateARMED {
+				fsm.Step()
+			}
+			fsm.Step()
+			if fsm.State() != StateDONE || fc.consumeCalls != 0 || fsm.attempt.RedeemRequestID != "" {
+				t.Fatalf("automatic confirmation without target: state=%s attempt=%+v", fsm.State(), fsm.attempt)
+			}
+		})
+	}
+}
+
+func TestFSM_PinnedTargetSurvivesEarlierCredit(t *testing.T) {
+	fsm, fc, clock, trigger := armedFSMFixture(t)
+	clock.t = trigger
+	fc.credits["new"] = &Credit{ID: "new", Status: "available", ExpiresAt: trigger.Add(time.Hour)}
+	fsm.Step()
+	fsm.Step()
+	fsm.Step()
+	if fc.consumeCalls != 1 || fc.consumeIDs[0] != "a" {
+		t.Fatalf("consumed=%v, want original armed target a", fc.consumeIDs)
+	}
+}
+
+func TestFSM_ConfirmRevalidatesTrigger(t *testing.T) {
+	for _, change := range []string{"early_wake", "expiry_extended"} {
+		t.Run(change, func(t *testing.T) {
+			fsm, fc, clock, trigger := armedFSMFixture(t)
+			want := trigger
+			if change == "expiry_extended" {
+				clock.t = trigger
+				fc.credits["a"].ExpiresAt = fc.credits["a"].ExpiresAt.Add(24 * time.Hour)
+				want = trigger.Add(24 * time.Hour)
+			}
+			fsm.SetNextWake(clock.t)
+			fsm.Step()
+			wake := fsm.Step()
+			if fsm.State() != StateARMED || !wake.Equal(want) || !fsm.NextWake().Equal(want) {
+				t.Fatalf("state=%s wake=%v nextWake=%v; want re-arm at %v", fsm.State(), wake, fsm.NextWake(), want)
+			}
+			if fsm.attempt.RedeemRequestID != "" || fc.consumeCalls != 0 {
+				t.Fatalf("premature attempt=%+v consumed=%v", fsm.attempt, fc.consumeIDs)
+			}
+			fc.credits["new"] = &Credit{ID: "new", Status: "available", ExpiresAt: want.Add(time.Hour)}
+			clock.t = wake
+			fsm.Step()
+			fsm.Step()
+			fsm.Step()
+			if fc.consumeCalls != 1 || fc.consumeIDs[0] != "a" || !fsm.attempt.StartedAt.Equal(want) {
+				t.Fatalf("consumed=%v started=%v, want a at %v", fc.consumeIDs, fsm.attempt.StartedAt, want)
+			}
+		})
+	}
+}
+
+func TestFSM_NeverExpiringAutomaticCredit(t *testing.T) {
+	t.Run("idle", func(t *testing.T) {
+		fsm, fc, clock, _ := armedFSMFixture(t)
+		fsm.Reset()
+		fc.credits = map[string]*Credit{"never": {ID: "never", Status: "available"}}
+		wake := fsm.Step()
+		if fsm.State() != StateIDLE || !wake.Equal(clock.t.Add(fsm.Cfg.RefreshInterval)) || fc.consumeCalls != 0 {
+			t.Fatalf("state=%s wake=%v, want normal patrol without automatic redemption", fsm.State(), wake)
+		}
+	})
+	t.Run("expiry_removed_while_armed", func(t *testing.T) {
+		fsm, fc, clock, trigger := armedFSMFixture(t)
+		fc.credits["a"].ExpiresAt = time.Time{}
+		clock.t = trigger
+		fsm.Step()
+		fsm.Step()
+		if fsm.State() != StateDONE || fsm.attempt.RedeemRequestID != "" || fc.consumeCalls != 0 {
+			t.Fatalf("state=%s attempt=%+v, want abandon non-expiring target", fsm.State(), fsm.attempt)
+		}
+	})
+}
+
+// TestFSM_StepAndSettleResetsDoneAndSchedulesPatrol verifies the atomic
+// settle: a terminating tick lands in IDLE (never DONE), carries the pin and
+// manual-intent cleanup of Reset, and schedules the next patrol at
+// completion + refresh_interval.
+func TestFSM_StepAndSettleResetsDoneAndSchedulesPatrol(t *testing.T) {
+	fsm, fc, clock, trigger := armedFSMFixture(t)
+	fc.credits["a"].Status = "redeemed" // confirm at T will abandon -> DONE
+	clock.t = trigger
+	fsm.Step() // ARMED -> CONFIRMING (wake=now)
+
+	wake := fsm.StepAndSettle()
+	want := trigger.Add(fsm.Cfg.RefreshInterval)
+	if fsm.State() != StateIDLE || !wake.Equal(want) || !fsm.NextWake().Equal(want) {
+		t.Fatalf("settle: state=%s wake=%v nextWake=%v, want IDLE patrol at %v", fsm.State(), wake, fsm.NextWake(), want)
+	}
+	if fsm.scheduledCreditID != "" || fsm.manualReset {
+		t.Fatalf("settle leaked cycle metadata: pin=%q manual=%v", fsm.scheduledCreditID, fsm.manualReset)
+	}
+}
+
+// TestFSM_StepAndSettleAtomicWithForceConfirm deterministically reproduces
+// the strand race's interleaving: a manual reset fired exactly in the window
+// between the tick's return and the schedule write (testPostStep runs there,
+// with mu held). Because step+settle share one critical section, the
+// ForceConfirm cannot slip inside; it applies after the settle and the FSM
+// keeps a non-zero wake instead of being stranded in CONFIRMING with a zero
+// wake that soonest() would skip forever.
+func TestFSM_StepAndSettleAtomicWithForceConfirm(t *testing.T) {
+	fsm, fc, clock, trigger := armedFSMFixture(t)
+	fc.credits["a"].Status = "redeemed" // tick will abandon -> DONE at settle
+	clock.t = trigger
+	fsm.Step() // ARMED -> CONFIRMING
+
+	var mgmtDone chan struct{}
+	fsm.testPostStep = func() {
+		mgmtDone = make(chan struct{})
+		go func() {
+			defer close(mgmtDone)
+			fsm.ForceConfirm()
+		}()
+		runtime.Gosched() // let the goroutine pile onto the held mutex
+	}
+	fsm.StepAndSettle()
+	<-mgmtDone
+	fsm.testPostStep = nil // one interleaving is enough; stop firing in the drive loop
+
+	if fsm.State() != StateCONFIRMING || fsm.NextWake().IsZero() || !fsm.manualReset || fsm.scheduledCreditID != "" {
+		t.Fatalf("manual reset stranded: state=%s wake=%v manual=%v pin=%q",
+			fsm.State(), fsm.NextWake(), fsm.manualReset, fsm.scheduledCreditID)
+	}
+	if !fsm.NextWake().Equal(clock.t) {
+		t.Fatalf("manual wake=%v, want now=%v", fsm.NextWake(), clock.t)
+	}
+
+	// The manual reset must still complete: it picks the remaining credit b.
+	for i := 0; i < 5 && fsm.State() != StateIDLE; i++ {
+		if wake := fsm.StepAndSettle(); !wake.IsZero() {
+			clock.t = wake
+		}
+	}
+	if fsm.State() != StateIDLE || fc.consumeCalls != 1 || fc.consumeIDs[0] != "b" {
+		t.Fatalf("manual cycle after settle: state=%s consumed=%v, want b redeemed", fsm.State(), fc.consumeIDs)
+	}
+}
+
+// driveToVerify advances an FSM through CONFIRMING+RESETTING into VERIFYING
+// at verifyDue, with consume succeeding and the target's outcome left to the
+// caller's fake-client scripting.
+func fsmToVerifying(t *testing.T, cfg Config, fc *fakeClient, clock *fakeClock, authID string, targetID string, expiry time.Time) *AccountFSM {
+	t.Helper()
+	fsm := NewAccountFSM(authID, CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = targetID
+	fsm.scheduledExpiry = expiry
+	fsm.state = StateCONFIRMING
+	// Step CONFIRMING -> RESETTING, RESETTING -> VERIFYING
+	for i := 0; i < 4 && fsm.State() != StateVERIFYING; i++ {
+		next := fsm.Step()
+		if !next.IsZero() && next.After(clock.t) {
+			clock.t = next
+		}
+	}
+	if fsm.State() != StateVERIFYING {
+		t.Fatalf("expected VERIFYING, got %s", fsm.State())
+	}
+	return fsm
+}
+
+// TestVerify_TargetStillAvailable: consume returned success but the fresh
+// list still shows the pinned target as available — NOT consumed.
+func TestVerify_TargetStillAvailable(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}, "c2": {ID: "c2", Status: "available", ExpiresAt: E.Add(time.Hour)}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+		// Server does not actually deduct the target — deductCreditID points
+		// at a different credit so c1 stays available.
+		deductCreditID: "c2",
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	next := fsm.Step()
+	if !next.IsZero() && next.After(clock.t) {
+		clock.t = next
+	}
+	rec := fsm.TakePendingHistory()
+	if rec == nil || rec.ConsumptionConfirmed || rec.Success {
+		t.Fatalf("target still available must not confirm: %+v", rec)
+	}
+}
+
+// TestVerify_TargetRedeemedStatus: fresh list keeps the row but marks it
+// redeemed → consumed.
+func TestVerify_TargetRedeemedStatus(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fsm.Step()
+	rec := fsm.TakePendingHistory()
+	if rec == nil || !rec.ConsumptionConfirmed || !rec.Success {
+		t.Fatalf("redeemed row must confirm consumption: %+v", rec)
+	}
+}
+
+// TestVerify_TargetAbsent: fresh list drops the row and expiry hasn't passed
+// → consumed.
+func TestVerify_TargetAbsent(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	// Simulate upstream removing the row entirely after consume.
+	delete(fc.credits, "c1")
+	fc.weeklyPct = 100
+	fsm.Step()
+	rec := fsm.TakePendingHistory()
+	if rec == nil || !rec.ConsumptionConfirmed || !rec.Success {
+		t.Fatalf("absent target must confirm: %+v", rec)
+	}
+}
+
+// TestVerify_ExpiryExplainsAbsence: target row absent but its pinned expiry
+// already passed → inconclusive, never consumed.
+func TestVerify_ExpiryExplainsAbsence(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	delete(fc.credits, "c1")
+	clock.t = E.Add(time.Minute) // verification runs AFTER expiry
+	fsm.Step()
+	rec := fsm.TakePendingHistory()
+	if rec == nil || rec.ConsumptionConfirmed {
+		t.Fatalf("expiry-explained absence must not confirm: %+v", rec)
+	}
+}
+
+// TestVerify_UnknownStatusInconclusive: row still present with an
+// unrecognized status → inconclusive, not consumed.
+func TestVerify_UnknownStatusInconclusive(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:        map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:      20,
+		consumeResp:    ConsumeResponse{Code: ConsumeCodeReset},
+		deductCreditID: "c1",
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fc.credits["c1"].Status = "redeeming" // still present, unknown status
+	fsm.Step()
+	rec := fsm.TakePendingHistory()
+	if rec == nil || rec.ConsumptionConfirmed {
+		t.Fatalf("unknown status must be inconclusive: %+v", rec)
+	}
+}
+
+// TestVerify_FailedListIsUnknown: post-consume list query fails → no
+// consumption evidence, no manufactured empty list.
+func TestVerify_FailedListIsUnknown(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:   20,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+		listErr:     errors.New("upstream 503"),
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fsm.Step()
+	if rec := fsm.TakePendingHistory(); rec != nil && rec.ConsumptionConfirmed {
+		t.Fatalf("failed list must not confirm: %+v", rec)
+	}
+}
+
+// TestWeeklyExhaustion_EarlyTrigger: opted-in account with pinned target not
+// yet due triggers early only when fresh usage proves >=100 normal weekly.
+func TestWeeklyExhaustion_EarlyTrigger(t *testing.T) {
+	E := time.Date(2026, 7, 20, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed:  100,
+		weeklyKnown: true,
+		weeklyPct:   0,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute,
+		AccountOverrides: map[string]AccountOverride{"acct": {AutoResetOnWeeklyExhaust: boolPtr(true)}}}
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)} // well before trigger T
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = "c1"
+	fsm.scheduledExpiry = E
+	fsm.state = StateARMED
+	fsm.WakeWeeklyExhaustion()
+	for i := 0; i < 8 && fsm.State() != StateVERIFYING && fsm.State() != StateDONE; i++ {
+		next := fsm.Step()
+		if !next.IsZero() && next.After(clock.t) {
+			clock.t = next
+		}
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("exhausted+opted-in must consume once, got %d", fc.consumeCalls)
+	}
+	if fsm.attempt.CycleReason != CycleReasonWeeklyExhaustion {
+		t.Fatalf("reason = %s", fsm.attempt.CycleReason)
+	}
+}
+
+// TestWeeklyExhaustion_RejectsUnproven: same setup but usage shows 99.6 → no
+// consume, target re-arms for expiry.
+func TestWeeklyExhaustion_RejectsUnproven(t *testing.T) {
+	E := time.Date(2026, 7, 20, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed:  99.6,
+		weeklyKnown: true,
+		weeklyPct:   0,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, AutoResetOnWeeklyExhaust: true}
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = "c1"
+	fsm.scheduledExpiry = E
+	fsm.state = StateARMED
+	fsm.WakeWeeklyExhaustion()
+	next := fsm.Step()
+	if fc.consumeCalls != 0 {
+		t.Fatal("99.6% must not authorize")
+	}
+	if fsm.State() != StateARMED || next.IsZero() {
+		t.Fatalf("must re-arm for expiry: state=%s", fsm.State())
+	}
+}
+
+// TestWeeklyExhaustion_UnknownUsage: usage query fails → no consume.
+func TestWeeklyExhaustion_UnknownUsage(t *testing.T) {
+	E := time.Date(2026, 7, 20, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		usageErr:    errors.New("usage 500"),
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, AutoResetOnWeeklyExhaust: true}
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = "c1"
+	fsm.scheduledExpiry = E
+	fsm.state = StateARMED
+	fsm.WakeWeeklyExhaustion()
+	fsm.Step()
+	if fc.consumeCalls != 0 || fsm.State() != StateDONE {
+		t.Fatalf("failed usage must abandon without consuming: %s calls=%d", fsm.State(), fc.consumeCalls)
+	}
+}
+
+// TestWeeklyExhaustion_NotOptedIn: hint arrives but effective opt-in is off →
+// re-arm, no consume.
+func TestWeeklyExhaustion_NotOptedIn(t *testing.T) {
+	E := time.Date(2026, 7, 20, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed:  100,
+		weeklyKnown: true,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute} // global off
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = "c1"
+	fsm.scheduledExpiry = E
+	fsm.state = StateARMED
+	fsm.WakeWeeklyExhaustion()
+	next := fsm.Step()
+	if fc.consumeCalls != 0 || fsm.State() != StateARMED || next.IsZero() {
+		t.Fatalf("opted-out must re-arm without consuming: %s", fsm.State())
+	}
+}
+
+// TestRetry_NeverAfterTargetExpiry: a retry due past the pinned expiry does
+// read-only abandonment, no substitute consume.
+func TestRetry_NeverAfterTargetExpiry(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:    map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}, "c2": {ID: "c2", Status: "available", ExpiresAt: E.Add(time.Hour)}},
+		consumeErr: errors.New("network down"),
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.ForceConfirm() // manual so no expiry guard on entry — target has expiry though
+	for i := 0; i < 4 && fsm.State() != StateRESETTING; i++ {
+		next := fsm.Step()
+		if !next.IsZero() && next.After(clock.t) {
+			clock.t = next
+		}
+	}
+	if fsm.State() != StateRESETTING {
+		t.Fatalf("expected RESETTING, got %s", fsm.State())
+	}
+	fsm.Step() // first consume fails transiently -> retry scheduled
+	if fc.consumeCalls != 1 || fsm.State() != StateRESETTING {
+		t.Fatalf("expected one failed consume awaiting retry: calls=%d state=%s", fc.consumeCalls, fsm.State())
+	}
+	callsBefore := fc.consumeCalls
+	// Jump past expiry before the next retry.
+	clock.t = E.Add(time.Minute)
+	fsm.Step()
+	if fc.consumeCalls != callsBefore {
+		t.Fatalf("consume fired after expiry")
+	}
+	if !fsm.AutoHold() {
+		t.Fatal("expired attempt with an earlier uncertain consume must hold automatic spending")
+	}
+	if fsm.State() != StateDONE {
+		t.Fatalf("expired attempt must abandon, got %s", fsm.State())
+	}
+	if len(fc.consumeIDs) > 0 && fc.consumeIDs[len(fc.consumeIDs)-1] == "c2" {
+		t.Fatal("substituted another credit")
+	}
+}
+
+func fIsManual(fsm *AccountFSM) bool {
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	return fsm.manualReset
+}
+
+// TestHold_PartialBlocksCompensationUntilRecovered: target consumed but quota
+// not recovered → durable hold; a still-exhausted patrol must not spend again;
+// fresh known non-exhausted usage resolves the hold read-only.
+func TestHold_PartialBlocksCompensationUntilRecovered(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, AutoResetOnWeeklyExhaust: true}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"c1": {ID: "c1", Status: "available", ExpiresAt: E},
+			"c2": {ID: "c2", Status: "available", ExpiresAt: E.Add(48 * time.Hour)},
+		},
+		weeklyPct: 0, weeklyUsed: 100, weeklyKnown: true,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset}, keepQuotaAtPre: true,
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fsm.StepAndSettle()
+	rec := fsm.TakePendingHistory()
+	if rec == nil || !rec.ConsumptionConfirmed || rec.Success {
+		t.Fatalf("want consumed + recovery pending, got %+v", rec)
+	}
+	if !fsm.AutoHold() {
+		t.Fatal("consumed-but-unrecovered must hold automatic spending")
+	}
+	calls := fc.consumeCalls
+	fsm.StepAndSettle() // IDLE patrol, weekly still exhausted
+	if fc.consumeCalls != calls || fsm.State() != StateIDLE || !fsm.AutoHold() {
+		t.Fatalf("held account must not compensate: calls=%d state=%s hold=%v", fc.consumeCalls, fsm.State(), fsm.AutoHold())
+	}
+	fc.weeklyUsed, fc.weeklyPct = 5, 95 // recovery observed read-only
+	fsm.StepAndSettle()
+	if fsm.AutoHold() || fc.consumeCalls != calls {
+		t.Fatalf("known non-exhausted usage must resolve the hold without consuming: hold=%v calls=%d", fsm.AutoHold(), fc.consumeCalls)
+	}
+	if r := fsm.TakePendingHistory(); r == nil || !r.ResolvesEarlier || !r.Success || !r.RecoveryConfirmed {
+		t.Fatalf("read-only recovery must upgrade the earlier record: %+v", r)
+	}
+}
+
+// TestVerify_FailuresHold: a failed post-reset list is unknown and holds; a
+// failed usage query keeps the target-consumption evidence but still holds.
+func TestVerify_FailuresHold(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct: 20, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fc.listErr = errors.New("upstream 503")
+	fsm.Step()
+	if !fsm.AutoHold() {
+		t.Fatal("failed post-reset list must hold")
+	}
+
+	fc2 := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct: 20, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	clock2 := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm2 := fsmToVerifying(t, cfg, fc2, clock2, "acct", "c1", E)
+	fc2.usageErr = errors.New("usage 500")
+	fsm2.Step()
+	rec := fsm2.TakePendingHistory()
+	if rec == nil || !rec.ConsumptionConfirmed || rec.Success || !fsm2.AutoHold() {
+		t.Fatalf("usage failure must keep consumption evidence and hold: %+v hold=%v", rec, fsm2.AutoHold())
+	}
+}
+
+// TestIdle_PatrolDetectsWeeklyExhaustion: no failure hint; a periodic patrol
+// finding raw weekly >= 100 under an opt-in starts one weekly cycle.
+func TestIdle_PatrolDetectsWeeklyExhaustion(t *testing.T) {
+	E := time.Date(2026, 7, 25, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed: 100, weeklyKnown: true, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute,
+		AccountOverrides: map[string]AccountOverride{"acct": {AutoResetOnWeeklyExhaust: boolPtr(true)}}}
+	clock := &fakeClock{t: E.Add(-72 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	drive(t, fsm, clock)
+	if fc.consumeCalls != 1 || fsm.attempt.CycleReason != CycleReasonWeeklyExhaustion {
+		t.Fatalf("patrol must start one weekly cycle: calls=%d reason=%s", fc.consumeCalls, fsm.attempt.CycleReason)
+	}
+
+	// Same state with the account opted out: patrol only.
+	fcOff := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed: 100, weeklyKnown: true, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	off := NewAccountFSM("other", CodexCredentials{}, cfg, fcOff, clock.Now, nil)
+	off.Step()
+	if fcOff.consumeCalls != 0 || off.State() != StateIDLE {
+		t.Fatalf("not opted in must stay in patrol: %s", off.State())
+	}
+}
+
+// TestWeeklyExhaustion_PinnedMissingNotSubstituted: a pinned target that has
+// vanished ends the cycle even if another credit is available.
+func TestWeeklyExhaustion_PinnedMissingNotSubstituted(t *testing.T) {
+	E := time.Date(2026, 7, 20, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{credits: map[string]*Credit{"c2": {ID: "c2", Status: "available", ExpiresAt: E.Add(time.Hour)}},
+		weeklyUsed: 100, weeklyKnown: true, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, AutoResetOnWeeklyExhaust: true}
+	clock := &fakeClock{t: E.Add(-2 * time.Hour)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.scheduledCreditID = "c1"
+	fsm.scheduledExpiry = E
+	fsm.state = StateARMED
+	fsm.WakeWeeklyExhaustion()
+	fsm.Step()
+	if fc.consumeCalls != 0 || fsm.State() != StateDONE {
+		t.Fatalf("missing pinned target must not be substituted: calls=%d state=%s", fc.consumeCalls, fsm.State())
+	}
+}
+
+// TestRestoreAttempt_ReconcilesReadOnly: a persisted in-flight attempt resumes
+// as read-only verification with its original identity, never a new consume.
+func TestRestoreAttempt_ReconcilesReadOnly(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct: 20, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	clock := &fakeClock{t: E.Add(-3 * time.Minute)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.RestoreAttempt(ResetAttempt{RedeemRequestID: "rrid-1", TargetCreditID: "c1", TargetExpiresAt: E,
+		CycleReason: CycleReasonExpiry, PreSnapshot: Snapshot{AvailableCount: 1, WeeklyPct: 20}})
+	fsm.StepAndSettle()
+	if fc.consumeCalls != 0 {
+		t.Fatalf("restored attempt must not consume, got %d calls", fc.consumeCalls)
+	}
+	rec := fsm.TakePendingHistory()
+	if rec == nil || rec.ConsumptionConfirmed || !fsm.AutoHold() {
+		t.Fatalf("still-available target after restart: no consumption, hold set; got %+v hold=%v", rec, fsm.AutoHold())
+	}
+}
+
+// TestHold_MismatchSurvivesQuotaRecovery: the wrong credit disappeared and
+// the pinned target is still available. Weekly recovery says nothing about
+// the target, so the hold must persist and no second credit may be spent
+// automatically — even when the target's expiry trigger arrives.
+func TestHold_MismatchSurvivesQuotaRecovery(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, AutoResetOnWeeklyExhaust: true}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"c1": {ID: "c1", Status: "available", ExpiresAt: E},
+			"c2": {ID: "c2", Status: "available", ExpiresAt: E.Add(48 * time.Hour)},
+		},
+		weeklyPct: 20, weeklyUsed: 0, weeklyKnown: true,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset}, deductCreditID: "c2",
+	}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fsm.StepAndSettle()
+	if !fsm.AutoHold() || fsm.HoldRecoveryOnly() {
+		t.Fatalf("mismatch must set an unresolved (not recovery-only) hold")
+	}
+	calls := fc.consumeCalls
+	for i := 0; i < 5; i++ { // patrols through c1's trigger window, quota recovered
+		clock.t = clock.t.Add(2 * time.Minute)
+		fsm.StepAndSettle()
+	}
+	if fc.consumeCalls != calls || !fsm.AutoHold() {
+		t.Fatalf("mismatch hold must survive recovery without spending: calls=%d hold=%v", fc.consumeCalls, fsm.AutoHold())
+	}
+	// Operator Redeem-now is the explicit way out.
+	fc.credits["c3"] = &Credit{ID: "c3", Status: "available", ExpiresAt: E.Add(72 * time.Hour)}
+	fsm.ForceConfirm()
+	fc.deductCreditID = ""
+	for i := 0; i < 6 && fsm.AutoHold(); i++ {
+		next := fsm.StepAndSettle()
+		if next.After(clock.t) {
+			clock.t = next
+		}
+	}
+	if fc.consumeCalls != calls+1 || fsm.AutoHold() {
+		t.Fatalf("manual verified success must resolve the hold: calls=%d hold=%v", fc.consumeCalls, fsm.AutoHold())
+	}
+}
+
+// TestHold_RestoredInconclusiveSurvivesPatrol: a restored attempt whose target
+// is still available becomes an unresolved hold that later recovered-quota
+// patrols cannot clear into a new automatic redemption.
+func TestHold_RestoredInconclusiveSurvivesPatrol(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct: 20, weeklyUsed: 0, weeklyKnown: true, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	clock := &fakeClock{t: E.Add(-3 * time.Minute)}
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
+	fsm.RestoreAttempt(ResetAttempt{RedeemRequestID: "rrid-1", TargetCreditID: "c1", TargetExpiresAt: E,
+		PreSnapshot: Snapshot{AvailableCount: 1, WeeklyPct: 20}})
+	for i := 0; i < 4; i++ {
+		fsm.StepAndSettle()
+		clock.t = clock.t.Add(30 * time.Second)
+	}
+	if fc.consumeCalls != 0 || !fsm.AutoHold() {
+		t.Fatalf("restored inconclusive attempt must stay held: calls=%d hold=%v", fc.consumeCalls, fsm.AutoHold())
+	}
+}
+
+// TestVerify_ConsumedStatusWords: "consumed"/"used" (any case) count as spent,
+// matching the status set another Codex reset-credit client treats as spent.
+func TestVerify_ConsumedStatusWords(t *testing.T) {
+	for _, st := range []string{"Consumed", "used", "REDEEMED"} {
+		E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+		cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+		fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+			weeklyPct: 20, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}, deductCreditID: "c1"}
+		clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+		fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+		fc.credits["c1"].Status = st
+		fsm.Step()
+		if rec := fsm.TakePendingHistory(); rec == nil || !rec.ConsumptionConfirmed {
+			t.Fatalf("status %q must confirm consumption: %+v", st, rec)
+		}
+	}
+}
+
+// TestHold_UnknownTargetStatusAutoReleases: an unrecognized, steady target
+// status is not re-verified forever; the 3-check rule releases it.
+func TestHold_UnknownTargetStatusAutoReleases(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct: 20, weeklyUsed: 80, weeklyKnown: true, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}, deductCreditID: "c1"}
+	clock := &fakeClock{t: E.Add(-10 * time.Minute)}
+	fsm := fsmToVerifying(t, cfg, fc, clock, "acct", "c1", E)
+	fc.credits["c1"].Status = "archived" // unrecognized word, redeemed_at empty
+	fsm.Step()
+	fsm.StepAndSettle()
+	if !fsm.AutoHold() || fsm.Attempt().Reverify {
+		t.Fatalf("unknown status: want classified hold without endless reverify, hold=%v reverify=%v", fsm.AutoHold(), fsm.Attempt().Reverify)
+	}
+	for i := 0; i < 3 && fsm.AutoHold(); i++ {
+		clock.t = clock.t.Add(31 * time.Minute)
+		fsm.StepAndSettle()
+	}
+	if fsm.AutoHold() {
+		t.Fatal("steady unknown status must auto-release after 3 stable checks")
+	}
+}

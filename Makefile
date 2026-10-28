@@ -3,7 +3,7 @@ VERSION ?= 0.1.0
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
-GO_LDFLAGS ?= -s -w -X main.pluginVersion=$(VERSION)
+GO_LDFLAGS ?= -s -w -X github.com/xz-dev/cpa-plugin-codex-auto-reset/internal/plugin.pluginVersion=$(VERSION)
 
 EXT_linux = so
 EXT_freebsd = so
@@ -21,7 +21,7 @@ CHECKSUMS_PATH ?= $(BUILD_DIR)/checksums.txt
 
 build:
 	mkdir -p $(dir $(PLUGIN_OUTPUT))
-	CGO_ENABLED=1 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -buildmode=c-shared -ldflags "$(GO_LDFLAGS)" -o $(PLUGIN_OUTPUT) .
+	CGO_ENABLED=1 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -buildmode=c-shared -ldflags "$(GO_LDFLAGS)" -o $(PLUGIN_OUTPUT) ./cmd/codex-auto-reset
 	rm -f $(PLUGIN_HEADER)
 
 test:
@@ -31,7 +31,7 @@ vet:
 	go vet ./...
 
 package: build
-	go run ./.github/scripts/package-release.go -library "$(PLUGIN_OUTPUT)" -archive "$(ARCHIVE_PATH)" -checksum "$(CHECKSUM_PATH)"
+	go run ./scripts/package-release -library "$(PLUGIN_OUTPUT)" -archive "$(ARCHIVE_PATH)" -checksum "$(CHECKSUM_PATH)"
 
 checksums: package
 	cat $(BUILD_DIR)/*.zip.sha256 | sort -k 2 > "$(CHECKSUMS_PATH)"

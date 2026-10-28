@@ -36,7 +36,7 @@ An automatic cycle never substitutes another credit if its pinned target is rede
 
 **Retries.** A consume that fails with a 5xx, network error or timeout is retried with the same `redeem_request_id` and the same target after 1, 2, 5, 10 and 30 minutes (at most 5 retries). `no_credit`, `nothing_to_reset`, any 4xx (including 429) and unknown codes stop at once. Before every request the pinned target's expiry is checked: an expired target is never sent and never substituted. If nothing was sent yet the cycle simply ends; if an earlier request may have landed, the account goes on hold (see below). With the default 5-minute lead time this leaves room for about three requests before expiry.
 
-**Safety invariants** (covered by production tests and the simulation in `sim/`):
+**Safety invariants** (covered by production tests and the simulation in `internal/sim/`):
 
 1. **Serial per account.** Only one POST /consume is ever in flight per account per cycle. All retries reuse the same target and `redeem_request_id`, allowing OpenAI to deduplicate them.
 2. **Always targeted.** The consume body always carries `credit_id`. Automatic confirmation validates the ID pinned when arming, not a newly selected credit. Manual Reset explicitly selects a fresh available target.
@@ -119,4 +119,4 @@ Before relying on this plugin in production, verify against real OpenAI:
 - [ ] Check while ARMED neither pulls the trigger wake forward nor consumes before the pinned target's trigger time.
 - [ ] Redeeming the pinned target externally while ARMED abandons that cycle without consuming a different credit.
 
-Real-credit verification is necessarily infrequent (credits are scarce and expire over weeks). The `sim/` directory contains a deterministic event-driven simulation that validated the FSM design across 231 tests before any production code was written; run `cd sim && go test ./...` to re-verify the design.
+Real-credit verification is necessarily infrequent (credits are scarce and expire over weeks). The `internal/sim/` package contains a deterministic event-driven simulation that validated the FSM design before any production code was written; `go test ./...` runs it with the rest of the tests.
