@@ -92,8 +92,22 @@ func (c *OpenAIClient) setAuthHeaders(req *http.Request, creds CodexCredentials)
 	req.Header.Set("User-Agent", codexUserAgent)
 }
 
-// ListCredits calls GET /backend-api/wham/rate-limit-reset-credits.
+// ListCredits calls GET /backend-api/wham/rate-limit-reset-credits and
+// returns the availability-filtered, expiry-sorted target list.
 func (c *OpenAIClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
+	return c.fetchCredits(creds, time.Now(), false)
+}
+
+// ListAllCredits calls the same endpoint but returns every returned record
+// unfiltered by status/expiry. Post-consume verification must judge the
+// pinned target's disappearance by identity across ALL records — the
+// available-filtered view cannot distinguish "consumed" from "redeemed /
+// expired / non-available".
+func (c *OpenAIClient) ListAllCredits(creds CodexCredentials) (Snapshot, error) {
+	return c.fetchCredits(creds, time.Now(), true)
+}
+
+func (c *OpenAIClient) fetchCredits(creds CodexCredentials, now time.Time, unfiltered bool) (Snapshot, error) {
 	u := c.baseURL() + resetCreditsEndpointPath
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
@@ -105,7 +119,7 @@ func (c *OpenAIClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return parseResetCreditsResponse(body, time.Now())
+	return parseResetCreditsResponse(body, now, unfiltered)
 }
 
 // GetUsage calls GET /backend-api/wham/usage.

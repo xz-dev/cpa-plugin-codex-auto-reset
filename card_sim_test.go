@@ -28,6 +28,10 @@ func (c *cardSimClient) ListCredits(CodexCredentials) (Snapshot, error) {
 	return Snapshot{Credits: out, AvailableCount: countAvailSim(out), WeeklyPct: -1}, nil
 }
 
+func (c *cardSimClient) ListAllCredits(CodexCredentials) (Snapshot, error) {
+	return c.ListCredits(CodexCredentials{})
+}
+
 func (c *cardSimClient) GetUsage(CodexCredentials) (Snapshot, error) {
 	return Snapshot{WeeklyPct: c.weeklyPct}, nil
 }
@@ -40,7 +44,15 @@ func (c *cardSimClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRe
 	return c.consume, nil
 }
 
-func countAvailSim(cs []Credit) int { n := 0; for _, c := range cs { if c.Status == "available" { n++ } }; return n }
+func countAvailSim(cs []Credit) int {
+	n := 0
+	for _, c := range cs {
+		if c.Status == "available" {
+			n++
+		}
+	}
+	return n
+}
 
 type simClock struct{ t time.Time }
 
@@ -197,6 +209,10 @@ func (c *errOnlyClient) ListCredits(CodexCredentials) (Snapshot, error) {
 		out = append(out, *cr)
 	}
 	return Snapshot{Credits: out, AvailableCount: countAvailSim(out), WeeklyPct: -1}, nil
+}
+
+func (c *errOnlyClient) ListAllCredits(CodexCredentials) (Snapshot, error) {
+	return c.ListCredits(CodexCredentials{})
 }
 
 func (c *errOnlyClient) GetUsage(CodexCredentials) (Snapshot, error) {

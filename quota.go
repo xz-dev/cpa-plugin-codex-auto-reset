@@ -25,32 +25,51 @@ type ConsumeResponse struct {
 
 // rawCredit captures only the fields we use from one row of the
 // rate-limit-reset-credits response. Other returned fields (reset_type,
-// granted_at, title, description, redeem_started_at, redeemed_at,
-// profile_image_url, profile_user_id) are accepted but ignored per spec §2.1.
+// granted_at, title, description, profile_image_url, profile_user_id) are
+// accepted but ignored per spec §2.1.
 type rawCredit struct {
-	ID        string  `json:"id"`
-	Status    string  `json:"status"`
-	ExpiresAt *string `json:"expires_at"`
+	ID         string  `json:"id"`
+	Status     string  `json:"status"`
+	ExpiresAt  *string `json:"expires_at"`
+	RedeemedAt *string `json:"redeemed_at"`
+	// Non-null while a redemption is in progress (seen null on real rows).
+	RedeemStartedAt *string `json:"redeem_started_at"`
 }
 
 type resetCreditsBody struct {
-	Credits        []rawCredit `json:"credits"`
-	AvailableCount int         `json:"available_count"`
-	TotalEarned    int         `json:"total_earned_count"` // accepted, ignored
+	// Pointers distinguish a missing/null field from an empty value: a
+	// wrong-shaped body must be an error, never a successful empty list that
+	// would make the pinned target look consumed.
+	Credits        *[]rawCredit `json:"credits"`
+	AvailableCount *int         `json:"available_count"`
+	TotalEarned    int          `json:"total_earned_count"` // accepted, ignored
 }
 
-// parseResetCreditsResponse parses GET /rate-limit-reset-credits. It applies
-// the §2.3 local filter+sort (status=="available", expires_at > now unless
-// zero) so the returned Credits slice is already the production target list.
-// AvailableCount comes straight from the server response body (authoritative).
-func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
+// parseResetCreditsResponse parses GET /rate-limit-reset-credits. With
+// unfiltered=false it applies the §2.3 local filter+sort (status=="available",
+// expires_at > now unless zero) so the returned Credits slice is already the
+// production target list. With unfiltered=true the raw record order is kept
+// so post-consume verification can judge the pinned target's disappearance
+// across every returned record. AvailableCount comes straight from the
+// server response body (authoritative).
+func parseResetCreditsResponse(raw []byte, now time.Time, unfiltered ...bool) (Snapshot, error) {
 	var body resetCreditsBody
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return Snapshot{}, fmt.Errorf("parse reset-credits response: %w", err)
 	}
-	credits := make([]Credit, 0, len(body.Credits))
-	for _, rc := range body.Credits {
+	if body.Credits == nil || body.AvailableCount == nil {
+		return Snapshot{}, fmt.Errorf("parse reset-credits response: missing credits or available_count")
+	}
+	credits := make([]Credit, 0, len(*body.Credits))
+	for _, rc := range *body.Credits {
+		if rc.ID == "" {
+			return Snapshot{}, fmt.Errorf("parse reset-credits response: credit without id")
+		}
 		c := Credit{ID: rc.ID, Status: rc.Status}
+		if rc.RedeemedAt != nil && *rc.RedeemedAt != "" {
+			c.Redeemed = true
+		}
+		c.RedeemStarted = rc.RedeemStartedAt != nil && *rc.RedeemStartedAt != ""
 		if rc.ExpiresAt != nil && *rc.ExpiresAt != "" {
 			if t, err := time.Parse(time.RFC3339, *rc.ExpiresAt); err == nil {
 				c.ExpiresAt = t
@@ -58,9 +77,11 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 		credits = append(credits, c)
 	}
-	credits = availableCreditsSorted(credits, now)
+	if !(len(unfiltered) > 0 && unfiltered[0]) {
+		credits = availableCreditsSorted(credits, now)
+	}
 	return Snapshot{
-		AvailableCount: body.AvailableCount,
+		AvailableCount: *body.AvailableCount,
 		Credits:        credits,
 		WeeklyPct:      -1, // not provided by this endpoint
 		CapturedAt:     now,
@@ -69,10 +90,12 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 
 // parseUsageResponse parses GET /wham/usage using flexible map lookups.
 // The real wire shape (confirmed from live data) is:
-//   "rate_limit": {
-//     "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
-//     "secondary_window": null
-//   }
+//
+//	"rate_limit": {
+//	  "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
+//	  "secondary_window": null
+//	}
+//
 // primary_window can be the WEEKLY window (604800s) when there's no
 // secondary. We identify the weekly window by limit_window_seconds ≈ 604800,
 // NOT by position (primary/secondary). code_review_rate_limit may also be
@@ -90,11 +113,12 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
-	// Scan all rate-limit paths for a window whose limit_window_seconds ≈ 604800
-	// (weekly). The window may be primary or secondary — we check both and
-	// pick the weekly one by duration, not position.
+	// Scan the NORMAL rate-limit paths for a window whose limit_window_seconds
+	// ≈ 604800 (weekly). code_review_rate_limit is deliberately excluded from
+	// exhaustion evidence: its weekly window is a dedicated code-review budget,
+	// not the normal weekly quota an exhaustion-based redeem must prove.
 	weeklyUsed := -1.0
-	for _, rlKey := range []string{"rate_limit", "rateLimit", "code_review_rate_limit", "codeReviewRateLimit"} {
+	for _, rlKey := range []string{"rate_limit", "rateLimit"} {
 		rl, ok := getMapAny(doc, rlKey)
 		if !ok {
 			continue
@@ -120,6 +144,35 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 			break
 		}
 	}
+	// Fall back to the code-review paths for the DISPLAY percentage only
+	// (older responses may place weekly under either limit block), but keep
+	// WeeklyKnown false in that case so it cannot authorize exhaustion.
+	weeklyKnown := weeklyUsed >= 0
+	if weeklyUsed < 0 {
+		for _, rlKey := range []string{"code_review_rate_limit", "codeReviewRateLimit"} {
+			rl, ok := getMapAny(doc, rlKey)
+			if !ok {
+				continue
+			}
+			for _, winKey := range []string{"primary_window", "primaryWindow", "secondary_window", "secondaryWindow"} {
+				win, ok := getMapAny(rl, winKey)
+				if !ok {
+					continue
+				}
+				secs, hasSecs := getIntAny(win, "limit_window_seconds", "limitWindowSeconds")
+				if !hasSecs || secs < 600000 || secs > 610000 {
+					continue
+				}
+				if used, ok := getFloatAny(win, "used_percent", "usedPercent"); ok {
+					weeklyUsed = used
+					break
+				}
+			}
+			if weeklyUsed >= 0 {
+				break
+			}
+		}
+	}
 
 	weeklyPct := 100
 	if weeklyUsed >= 0 {
@@ -132,6 +185,8 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 	return Snapshot{
 		AvailableCount: availableCount,
 		WeeklyPct:      weeklyPct,
+		WeeklyUsedPct:  weeklyUsed,
+		WeeklyKnown:    weeklyKnown,
 		CapturedAt:     now,
 	}, nil
 }

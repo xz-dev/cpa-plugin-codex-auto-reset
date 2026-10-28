@@ -20,8 +20,13 @@ const codexUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTermi
 // every other value here is a true const.
 const (
 	postResetVerifyDelay = 1 * time.Minute
-	maxLogEntries        = 1000
-	logRetention         = 7 * 24 * time.Hour
+	// Classified automatic-spending holds auto-release after this many
+	// consecutive stable read-only checks, each more than holdCheckMinGap
+	// apart (operator decision 2026-10-28: tolerate network jitter).
+	holdStableChecks = 3
+	holdCheckMinGap  = 30 * time.Minute
+	maxLogEntries    = 1000
+	logRetention     = 7 * 24 * time.Hour
 	// credentialRetryInterval is how soon an enabled account is retried after
 	// its credentials fail to load (CPA auth file not ready at startup, token
 	// mid-refresh, or operator re-login). Previously a failed initial load

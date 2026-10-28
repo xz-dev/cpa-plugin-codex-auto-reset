@@ -51,6 +51,32 @@ type Worker struct {
 	// next wake time instead of sleeping in real time. Lets tests run a full
 	// multi-day FSM cycle in milliseconds. Production leaves this false.
 	testAccelerate bool
+
+	// RestoreAttempt, when non-nil, returns a persisted attempt to re-seed
+	// into a newly constructed FSM (restart recovery). Wired by main.go.
+	RestoreAttempt func(authID string) ResetAttempt
+
+	// RestoreAutoHold, when non-nil, returns the persisted automatic-spending
+	// hold to re-seed into a newly constructed FSM. Wired by main.go.
+	RestoreAutoHold func(authID string) (hold, recoveryOnly bool)
+
+	// PersistAttempt, when non-nil, synchronously persists a new attempt's
+	// identity before its first consume. Wired by main.go into every FSM.
+	PersistAttempt func(authID string, a ResetAttempt) error
+
+	// hints holds coalesced weekly-exhaustion wake-ups under its own short
+	// mutex. usage.handle only touches this set — never w.mu (Reconcile can
+	// hold it while waiting on a busy FSM) and never an FSM; the Run loop
+	// filters eligibility and applies hints on its own goroutine.
+	hintMu sync.Mutex
+	hints  map[string]bool
+	// started/done let a lifecycle handoff wait for Run to exit, so two
+	// workers never step the same account concurrently.
+	started bool
+	done    chan struct{}
+	// draining marks disabled accounts kept only to finish an in-flight
+	// consume/verification. They are removed once back in IDLE.
+	draining map[string]bool
 }
 
 func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() time.Time) *Worker {
@@ -60,6 +86,7 @@ func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() ti
 	return &Worker{
 		cfg: cfg, enabled: enabled, loader: loader, nowFn: nowFn,
 		fsms: map[string]*AccountFSM{}, missingRetryAt: map[string]time.Time{},
+		hints: map[string]bool{}, draining: map[string]bool{}, done: make(chan struct{}),
 		logs:   newLogRing(maxLogEntries),
 		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1),
 	}
@@ -105,6 +132,19 @@ func (w *Worker) EachFSM(fn func(*AccountFSM)) {
 		if fsm, ok := byKey[k]; ok {
 			fn(fsm)
 		}
+	}
+}
+
+// StopAndWait stops the worker and waits until its Run loop has returned
+// (including any in-flight step). Callers must not hold pluginStateMu: the
+// last step may need it to persist.
+func (w *Worker) StopAndWait() {
+	w.Stop()
+	w.mu.Lock()
+	started := w.started
+	w.mu.Unlock()
+	if started {
+		<-w.done
 	}
 }
 
@@ -169,6 +209,90 @@ func (w *Worker) ForceConfirm(authID string) error {
 	return nil
 }
 
+// WakeWeeklyExhaustion coalesces a quota-exhaustion hint for one account into
+// the same worker path as patrols: the FSM is pulled to an immediate
+// CONFIRMING tick which must still pass the fresh weekly-exhaustion check
+// before consuming. Duplicate hints for an active consume/verify are
+// absorbed by the FSM. Returns an error when the account is not enabled.
+func (w *Worker) WakeWeeklyExhaustion(authID string) error {
+	w.hintMu.Lock()
+	w.hints[authID] = true
+	w.hintMu.Unlock()
+	w.wake()
+	return nil
+}
+
+// applyHints moves queued exhaustion hints into their FSMs. Runs on the
+// worker goroutine, which is the only stepper, so FSM locks are uncontended.
+func (w *Worker) applyHints() {
+	w.hintMu.Lock()
+	hints := w.hints
+	w.hints = map[string]bool{}
+	w.hintMu.Unlock()
+	if len(hints) == 0 {
+		return
+	}
+	w.mu.Lock()
+	var fsms []*AccountFSM
+	for id := range hints {
+		// Unknown, disabled, or draining accounts drop the hint here.
+		if fsm, ok := w.fsms[id]; ok && !w.draining[id] {
+			fsms = append(fsms, fsm)
+		}
+	}
+	w.mu.Unlock()
+	for _, fsm := range fsms {
+		fsm.WakeWeeklyExhaustion()
+	}
+}
+
+// Reconcile applies a new config and enabled set IN PLACE: existing FSMs get
+// the new policy via SetPolicy (preserving active attempt identity, pinned
+// target, idempotency key, and verification evidence), newly enabled
+// accounts get FSMs, and disabled accounts are removed only when they are
+// not mid-cycle — an in-flight attempt finishes or reconciles rather than
+// being silently discarded. Returns the list of disabled accounts whose
+// in-flight attempts were retained.
+func (w *Worker) Reconcile(cfg Config, enabled []string) []string {
+	w.mu.Lock()
+	w.cfg = cfg
+	enabledSet := make(map[string]bool, len(enabled))
+	for _, id := range enabled {
+		enabledSet[id] = true
+	}
+	w.enabled = append([]string(nil), enabled...)
+	// Update policies for surviving FSMs; drop disabled ones not mid-cycle.
+	var retained []string
+	for id, fsm := range w.fsms {
+		if enabledSet[id] {
+			fsm.SetPolicy(cfg)
+			continue
+		}
+		// Only a consume/verification already under way is kept (to finish
+		// or reconcile); it never starts another cycle (see stepAccountSafe).
+		st := fsm.State()
+		if st == StateRESETTING || st == StateVERIFYING {
+			fsm.SetPolicy(cfg)
+			w.draining[id] = true
+			retained = append(retained, id)
+			continue
+		}
+		delete(w.fsms, id)
+		delete(w.draining, id)
+	}
+	for id := range enabledSet {
+		delete(w.draining, id)
+	}
+	sort.Strings(retained)
+	w.mu.Unlock()
+	// Newly enabled accounts get FSMs outside the lock (ensureFSM self-locks).
+	for _, id := range enabled {
+		w.ensureFSM(id)
+	}
+	w.wake()
+	return retained
+}
+
 // Run blocks until Stop. Initializes FSMs, then loops: pick the soonest
 // nextWake, sleep (or advance the clock if testAccelerate), step that account,
 // refresh its credentials first.
@@ -179,6 +303,10 @@ func (w *Worker) ForceConfirm(authID string) error {
 // accounts forever. The panicking account gets its nextWake pushed forward
 // and the loop continues.
 func (w *Worker) Run() {
+	w.mu.Lock()
+	w.started = true
+	w.mu.Unlock()
+	defer close(w.done)
 	defer func() {
 		if r := recover(); r != nil {
 			// This should never happen — the inner recover should catch per-account
@@ -206,6 +334,7 @@ func (w *Worker) Run() {
 		// otherwise be invisible to soonest() forever. Retry them on the
 		// credential backoff (and immediately if the backoff has elapsed).
 		w.retryMissingFSMs()
+		w.applyHints()
 		nextAcct, nextWake := w.soonest()
 		if nextAcct == "" {
 			// Nothing is scheduled: only missing-credential retries remain.
@@ -248,6 +377,9 @@ func (w *Worker) stepAccountSafe(authID string) {
 			// Push the account's next wake forward so it retries later.
 			w.mu.Lock()
 			if fsm, ok := w.fsms[authID]; ok {
+				// Wherever the tick panicked (loader, or after a check restored
+				// the streak), an aborted tick is not a stable check.
+				fsm.BreakHoldStreak()
 				fsm.SetNextWake(w.nowFn().Add(w.cfg.RefreshInterval))
 			}
 			w.mu.Unlock()
@@ -258,7 +390,8 @@ func (w *Worker) stepAccountSafe(authID string) {
 	fsm := w.fsms[authID]
 	w.mu.Unlock()
 	if fsm == nil {
-		w.ensureFSM(authID)
+		// Removed (disabled/drained) since it was scheduled. Missing enabled
+		// accounts are re-created by retryMissingFSMs, never here.
 		return
 	}
 
@@ -271,6 +404,7 @@ func (w *Worker) stepAccountSafe(authID string) {
 			State: fsm.State(), Message: "credential load failed: " + err.Error(),
 			NextAction: "retry credential load", NextAt: &next,
 		})
+		fsm.BreakHoldStreak() // an aborted check is not a stable one
 		fsm.SetNextWake(next)
 		return
 	}
@@ -291,6 +425,16 @@ func (w *Worker) stepAccountSafe(authID string) {
 	// Mirror FSM state into the persisted PluginState.
 	if w.StateSync != nil {
 		w.StateSync(authID, fsm)
+	}
+	// A disabled account that finished its in-flight attempt leaves the
+	// worker instead of patrolling into a new cycle.
+	if fsm.State() == StateIDLE {
+		w.mu.Lock()
+		if w.draining[authID] {
+			delete(w.fsms, authID)
+			delete(w.draining, authID)
+		}
+		w.mu.Unlock()
 	}
 }
 
@@ -314,16 +458,44 @@ func (w *Worker) ensureFSM(id string) {
 		})
 		return
 	}
-	fsm := NewAccountFSM(id, creds, w.cfg, client, w.nowFn, w.makeLogFn(id))
+	w.mu.Lock()
+	cfg := w.cfg
+	w.mu.Unlock()
+	fsm := NewAccountFSM(id, creds, cfg, client, w.nowFn, w.makeLogFn(id))
+	if w.PersistAttempt != nil {
+		persist := w.PersistAttempt
+		fsm.PersistAttempt = func(a ResetAttempt) error { return persist(id, a) }
+	}
+	// Restore a persisted in-flight attempt so an uncertain pre-restart
+	// outcome reconciles conservatively instead of becoming a fresh consume.
+	if w.RestoreAutoHold != nil {
+		fsm.SetAutoHold(w.RestoreAutoHold(id)) // before RestoreAttempt (it reads the hold)
+	}
+	if w.RestoreAttempt != nil {
+		fsm.RestoreAttempt(w.RestoreAttempt(id))
+	}
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
 	fsm.SetNextWake(w.nowFn())
 	w.mu.Lock()
-	if _, ok := w.fsms[id]; !ok {
+	// Credential loading ran unlocked: a disable (or policy change) may have
+	// been accepted meanwhile. Insert only if still enabled, with the
+	// current policy.
+	if _, ok := w.fsms[id]; !ok && w.isEnabledLocked(id) {
+		fsm.SetPolicy(w.cfg)
 		w.fsms[id] = fsm
 		delete(w.missingRetryAt, id)
 	}
 	w.mu.Unlock()
+}
+
+func (w *Worker) isEnabledLocked(id string) bool {
+	for _, e := range w.enabled {
+		if e == id {
+			return true
+		}
+	}
+	return false
 }
 
 // retryMissingFSMs re-attempts credential loads for enabled accounts that are

@@ -67,7 +67,11 @@ import (
 )
 
 var (
-	hostAPI        atomic.Pointer[C.cliproxy_host_api]
+	hostAPI atomic.Pointer[C.cliproxy_host_api]
+	// pluginStateMu guards globalState (shared with managementHandlers.mu).
+	// Lock order: AccountFSM.mu -> pluginStateMu is allowed only on the worker
+	// goroutine (PersistAttempt). Never call into an FSM or the Worker while
+	// holding pluginStateMu from any other goroutine.
 	pluginStateMu  sync.Mutex
 	globalState    = &PluginState{Accounts: map[string]AccountRuntime{}}
 	globalWorker   *Worker
@@ -77,7 +81,7 @@ var (
 	// dir). All saves go through it so reconfigure cannot split state
 	// across locations.
 	globalStatePath string
-	pluginVersion   = "0.1.13"
+	pluginVersion   = "0.2.0"
 )
 
 func main() {}
@@ -240,6 +244,7 @@ type registration struct {
 
 type registrationCapabilities struct {
 	ManagementAPI bool `json:"management_api"`
+	UsagePlugin   bool `json:"usage_plugin"`
 }
 
 type managementRequest struct {
@@ -257,6 +262,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(managementRegistrationResponse())
 	case pluginabi.MethodManagementHandle:
 		return okEnvelope(handleManagementRequest(request))
+	case pluginabi.MethodUsageHandle:
+		handleUsageRecord(request)
+		return okEnvelope(map[string]any{})
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -278,6 +286,16 @@ func configurePlugin(raw []byte) error {
 		cfg = parsed
 	}
 
+	// Stop the previous worker and wait for its in-flight step BEFORE taking
+	// pluginStateMu: that step may need the lock to persist, and two workers
+	// must never step the same account at once.
+	pluginStateMu.Lock()
+	old := globalWorker
+	pluginStateMu.Unlock()
+	if old != nil {
+		old.StopAndWait()
+	}
+
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
 
@@ -293,6 +311,10 @@ func configurePlugin(raw []byte) error {
 	// sources are kept as .migrated, never destroyed.
 	migrateLegacyState(statePath)                   // pre-0.1.7 CWD-relative file
 	migrateStateFile(defaultStatePath(), statePath) // 0.1.7+ OS user-config dir
+	if filepath.Base(statePath) == authDirStateFile {
+		// <=0.1.13 auth-dir state.json, which CPA listed as an auth file.
+		migrateStateFile(filepath.Join(filepath.Dir(statePath), "state.json"), statePath)
+	}
 	loaded, source, err := loadState(statePath)
 	if err != nil {
 		// Start empty but treat persistence as suspect: log loudly so the
@@ -314,10 +336,7 @@ func configurePlugin(raw []byte) error {
 	globalState = loaded
 	globalState.Config = cfg
 
-	// Stop any prior worker, start a fresh one with the resolved config + accounts.
-	if globalWorker != nil {
-		globalWorker.Stop()
-	}
+	// Start a fresh worker (the prior one was stopped and drained above).
 	enabled := cfg.EnabledAccounts
 	globalWorker = NewWorker(cfg, enabled, hostCredsLoader, time.Now)
 	// Always announce the state location and load source — on FIRST load too,
@@ -349,11 +368,7 @@ func configurePlugin(raw []byte) error {
 	// Wire StateSync so the management UI sees live FSM state and a restart
 	// resumes mid-cycle. Debounce persistence: only write to disk at most every
 	// stateSyncPersistInterval to avoid hammering the file on tight retry loops.
-	globalWorker.StateSync = func(authID string, fsm *AccountFSM) {
-		rec := syncFSMIntoGlobalState(globalWorker.Logs(), authID, fsm)
-		afterVerifiedReset(globalWorker.Logs(), authID, rec)
-		debouncedSaveState(statePath)
-	}
+	wireWorkerPersistence(globalWorker)
 	go globalWorker.Run()
 
 	if globalHandlers == nil {
@@ -364,60 +379,147 @@ func configurePlugin(raw []byte) error {
 		globalHandlers.worker = globalWorker
 	}
 	globalHandlers.lister = listCodexAccountsForUI
-	globalHandlers.OnSettingsChanged = restartWorkerFromState
+	globalHandlers.OnSettingsChanged = reconcileWorkerFromState
 	return nil
 }
 
-// restartWorkerFromState stops the current worker (if any) and starts a fresh
-// one using the current globalState.Config. Called on plugin load AND on every
-// PUT /settings so config changes (enabled_accounts, refresh_interval) take
-// effect immediately instead of requiring a plugin reload.
-func restartWorkerFromState() {
-	pluginStateMu.Lock()
-	defer pluginStateMu.Unlock()
-	if globalWorker != nil {
-		globalWorker.Stop()
-	}
+// newWorkerFromStateLocked builds a Worker from the current global state.
+// Caller holds pluginStateMu.
+func newWorkerFromStateLocked() *Worker {
 	cfg := globalState.Config
 	w := NewWorker(cfg, cfg.EnabledAccounts, hostCredsLoader, time.Now)
-	// Carry over existing logs so a settings-change restart doesn't lose them.
 	if globalWorker != nil {
 		w.Logs().load(globalWorker.Logs().all())
 	} else if len(globalState.Logs) > 0 {
 		w.Logs().load(globalState.Logs)
 	}
-	w.StateSync = func(authID string, fsm *AccountFSM) {
-		rec := syncFSMIntoGlobalState(w.Logs(), authID, fsm)
-		afterVerifiedReset(w.Logs(), authID, rec)
-		if globalStatePath == "" {
-			globalStatePath = defaultStatePath() // defensive: never expected
-		}
-		debouncedSaveState(globalStatePath)
-	}
-	globalWorker = w
+	wireWorkerPersistence(w)
 	if globalHandlers != nil {
 		globalHandlers.worker = w
 	}
-	go w.Run()
+	return w
+}
+
+// wireWorkerPersistence connects a worker to the persisted global state:
+// per-step mirroring (synchronous whenever attempt identity, hold, or reset
+// evidence changed; debounced otherwise), restart restore, and the
+// synchronous pre-consume attempt write. Callbacks take pluginStateMu
+// themselves, so the worker must never invoke them while holding it.
+func wireWorkerPersistence(w *Worker) {
+	w.StateSync = func(authID string, fsm *AccountFSM) {
+		rec, critical := syncFSMIntoGlobalState(w.Logs(), authID, fsm)
+		path := currentStatePath()
+		if critical || rec != nil {
+			if err := SaveStateNow(path); err != nil {
+				w.Logs().append(LogEntry{Timestamp: time.Now(), Level: "error", Scope: authID,
+					Message: "persisting reset evidence failed: " + err.Error()})
+			}
+		} else {
+			debouncedSaveState(path)
+		}
+		afterVerifiedReset(w.Logs(), authID, rec)
+	}
+	w.RestoreAttempt = func(authID string) ResetAttempt {
+		pluginStateMu.Lock()
+		defer pluginStateMu.Unlock()
+		return globalState.Accounts[authID].Attempt
+	}
+	w.RestoreAutoHold = func(authID string) (bool, bool) {
+		pluginStateMu.Lock()
+		defer pluginStateMu.Unlock()
+		rt := globalState.Accounts[authID]
+		return rt.AutoHold, rt.HoldRecoveryOnly
+	}
+	w.PersistAttempt = persistAttemptNow
+}
+
+func currentStatePath() string {
+	pluginStateMu.Lock()
+	defer pluginStateMu.Unlock()
+	if globalStatePath == "" {
+		globalStatePath = defaultStatePath() // defensive: never expected
+	}
+	return globalStatePath
+}
+
+// persistAttemptNow durably records a new attempt before its first consume.
+// A failed write is returned so the FSM refuses to spend.
+func persistAttemptNow(authID string, a ResetAttempt) error {
+	pluginStateMu.Lock()
+	defer pluginStateMu.Unlock()
+	if globalStatePath == "" {
+		globalStatePath = defaultStatePath()
+	}
+	rt := globalState.Accounts[authID]
+	rt.AuthID = authID
+	rt.State = StateRESETTING
+	rt.Attempt = a
+	globalState.Accounts[authID] = rt
+	return saveState(globalStatePath, globalState)
+}
+
+// reconcileWorkerFromState applies a saved config change in place: per-account
+// policies and the enabled set are updated on the live FSM map, so an active
+// consume/retry/verify retains its target, idempotency key, pre-snapshot, and
+// verification evidence instead of being restarted as a new cycle.
+func reconcileWorkerFromState() {
+	pluginStateMu.Lock()
+	if globalWorker == nil {
+		globalWorker = newWorkerFromStateLocked()
+		go globalWorker.Run()
+		pluginStateMu.Unlock()
+		return
+	}
+	w := globalWorker
+	cfg := globalState.Config
+	pluginStateMu.Unlock()
+	// Reconcile builds FSMs for newly enabled accounts, whose restore
+	// callbacks take pluginStateMu: never call it while holding that lock.
+	retained := w.Reconcile(cfg, cfg.EnabledAccounts)
+	for _, id := range retained {
+		w.Logs().append(LogEntry{
+			Timestamp: time.Now(), Level: "info", Scope: id,
+			Message: "account disabled; in-flight redemption finishing or reconciling",
+		})
+	}
 }
 
 // syncFSMIntoGlobalState mirrors one FSM snapshot into the persisted state and
 // returns a pending reset-history record (if the step completed a cycle).
 // Returns the record to the caller so host-side post-reset work can run
 // outside pluginStateMu.
-func syncFSMIntoGlobalState(logs *logRing, authID string, fsm *AccountFSM) *ResetRecord {
+func syncFSMIntoGlobalState(logs *logRing, authID string, fsm *AccountFSM) (*ResetRecord, bool) {
+	// Snapshot the FSM before pluginStateMu: never take FSM.mu under it.
+	cur := AccountRuntime{
+		AuthID:           authID,
+		State:            fsm.State(),
+		NextWake:         fsm.NextWake(),
+		Attempt:          fsm.Attempt(),
+		AutoHold:         fsm.AutoHold(),
+		HoldRecoveryOnly: fsm.HoldRecoveryOnly(),
+		LastSnapshot:     fsm.LastSnapshot(),
+	}
+	// Pending reset history (set in stepVERIFYING, not cleared by Reset).
+	r := fsm.TakePendingHistory()
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
-	globalState.Accounts[authID] = AccountRuntime{
-		AuthID:       authID,
-		State:        fsm.State(),
-		NextWake:     fsm.NextWake(),
-		LastSnapshot: fsm.LastSnapshot(),
-	}
-	// Collect pending reset history from the FSM (set in stepVERIFYING,
-	// not cleared by Reset).
+	prev := globalState.Accounts[authID]
+	globalState.Accounts[authID] = cur
+	// Hold-release progress is not critical: RestoreAttempt discards it.
+	critical := prev.Attempt.RedeemRequestID != cur.Attempt.RedeemRequestID ||
+		prev.AutoHold != cur.AutoHold || prev.HoldRecoveryOnly != cur.HoldRecoveryOnly
 	var rec *ResetRecord
-	if r := fsm.TakePendingHistory(); r != nil {
+	if r != nil && r.ResolvesEarlier {
+		// Read-only recovery of an earlier "recovery pending" record.
+		for i := len(globalState.ResetHistory) - 1; i >= 0; i-- {
+			h := &globalState.ResetHistory[i]
+			if h.AuthID == r.AuthID && h.CreditID == r.CreditID && !h.Success {
+				h.Success, h.RecoveryConfirmed, h.PostWeeklyPct = true, true, r.PostWeeklyPct
+				break
+			}
+		}
+		rec = r
+	} else if r != nil {
 		globalState.ResetHistory = append(globalState.ResetHistory, *r)
 		// Cap at 500 entries (FIFO).
 		if len(globalState.ResetHistory) > 500 {
@@ -427,7 +529,7 @@ func syncFSMIntoGlobalState(logs *logRing, authID string, fsm *AccountFSM) *Rese
 	}
 	// Also sync logs to the persisted state.
 	globalState.Logs = logs.all()
-	return rec
+	return rec, critical
 }
 
 // afterVerifiedReset clears CPA's own model/credential cooldown for an
@@ -521,7 +623,7 @@ func pluginRegistration() registration {
 			Author:           "Jeffery",
 			GitHubRepository: "https://github.com/JefferyZhang2019/cpa-plugin-codex-auto-reset",
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true},
 	}
 }
 
@@ -535,7 +637,6 @@ func managementRegistrationResponse() pluginapi.ManagementRegistrationResponse {
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/status"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/accounts"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/auth-list"},
-		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/debug/usage"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/logs"},
 		{Method: http.MethodPut, Path: "/plugins/codex-auto-reset/settings"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check"},
@@ -662,23 +763,28 @@ func defaultStatePath() string {
 //  1. explicit absolute state_dir from the plugin's config_yaml (operator
 //     override; CPA's config.yaml lives on a mounted volume in container
 //     deployments, so the override itself is durable)
-//  2. <auth-dir>/plugin-state/codex-auto-reset/state.json — CPA's auth dir,
+//  2. <auth-dir>/plugin-state/codex-auto-reset/state.data — CPA's auth dir,
 //     derived from host.auth.list entry paths. Operators volume-mount the
 //     auth dir (credentials must survive), so state here survives image
-//     updates and container recreates. The subdirectory keeps plugin state
-//     out of CPA's auth-file scan root.
+//     updates and container recreates. CPA's file token store walks the auth
+//     dir recursively and loads every *.json as an auth entry, so this file
+//     (and its .tmp/.bak siblings) must never end in ".json".
 //  3. <os-user-config-dir>/CLIProxyAPI/codex-auto-reset/state.json — the
 //     0.1.7+ default (defaultStatePath)
 //
 // The fallback chain is also the migration chain: configurePlugin moves any
 // existing state forward to the resolved primary exactly once.
+// authDirStateFile is the state file name under the auth dir; see
+// resolveStatePath for why it is not *.json.
+const authDirStateFile = "state.data"
+
 func resolveStatePath(stateDir string, authEntries []pluginapi.HostAuthFileEntry) string {
 	if dir := strings.TrimSpace(stateDir); dir != "" && filepath.IsAbs(dir) {
 		return filepath.Join(dir, "state.json")
 	}
 	for _, e := range authEntries {
 		if e.Path != "" && filepath.IsAbs(e.Path) {
-			return filepath.Join(filepath.Dir(e.Path), "plugin-state", "codex-auto-reset", "state.json")
+			return filepath.Join(filepath.Dir(e.Path), "plugin-state", "codex-auto-reset", authDirStateFile)
 		}
 	}
 	return defaultStatePath()
@@ -806,9 +912,8 @@ func debouncedSaveState(path string) {
 	lastStatePersist = time.Now()
 	lastStatePersistMu.Unlock()
 	pluginStateMu.Lock()
-	snapshot := globalState
-	pluginStateMu.Unlock()
-	_ = saveState(path, snapshot)
+	defer pluginStateMu.Unlock()
+	_ = saveState(path, globalState)
 }
 
 // SaveStateNow forces an immediate persist (used on shutdown / reconfigure).
@@ -817,9 +922,8 @@ func SaveStateNow(path string) error {
 	lastStatePersist = time.Now()
 	lastStatePersistMu.Unlock()
 	pluginStateMu.Lock()
-	snapshot := globalState
-	pluginStateMu.Unlock()
-	return saveState(path, snapshot)
+	defer pluginStateMu.Unlock()
+	return saveState(path, globalState)
 }
 
 var _ = strings.TrimSpace

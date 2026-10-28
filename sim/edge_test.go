@@ -119,8 +119,8 @@ func TestWrongCreditConsumed_DetectsMismatch(t *testing.T) {
 			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
 			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
 		},
-		WeeklyPct:   25,
-		ConsumeCode: "reset",
+		WeeklyPct:    25,
+		ConsumeCode:  "reset",
 		WindowsReset: 2,
 	}
 	// BUG-injection: server deducts the WRONG credit (the later one), not the
@@ -205,7 +205,9 @@ func TestLongPatrolRhythm(t *testing.T) {
 func armedFixture(t *testing.T) (*accountFSM, *FakeOpenAIClient, time.Time) {
 	t.Helper()
 	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
-	cfg := DefaultConfig()
+	// Explicit legacy-scale timings: this fixture's -12h arming distance only
+	// works when the patrol interval spans it. Defaults are now 1h/5m.
+	cfg := Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour, PostResetDelay: time.Minute}
 	client := newClient("a", E, 25)
 	client.Credits["b"] = &Credit{ID: "b", Status: "available", ExpiresAt: E.Add(14 * 24 * time.Hour)}
 	fsm := newFSM(cfg, client, E.Add(-12*time.Hour), "")
@@ -253,7 +255,7 @@ func TestAutomaticConfirmRequiresTarget(t *testing.T) {
 		t.Run(string(state), func(t *testing.T) {
 			E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
 			client := newClient("a", E, 25)
-			fsm := newFSM(DefaultConfig(), client, E.Add(-time.Hour), "")
+			fsm := newFSM(Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour, PostResetDelay: time.Minute}, client, E.Add(-time.Hour), "")
 			fsm.state = state
 			if state == StateARMED {
 				fsm.step()
@@ -342,4 +344,40 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestRetryCrossingExpiry_NoConsumeAfterExpiry mirrors production: with a
+// 5-minute lead, backoff runs past the pinned expiry and the cycle abandons
+// instead of consuming an expired target or substituting another.
+func TestRetryCrossingExpiry_NoConsumeAfterExpiry(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, PostResetDelay: time.Minute}
+	client := newClient("c1", E, 20)
+	client.FailFirstN = 10
+	client.FailErr = fmt.Errorf("network down")
+	out := Run(cfg, client, E.Add(-3*time.Hour), 2*24*time.Hour)
+	if out.NumConsumePOST != 3 { // at T, T+1m, T+3m; next retry T+8m > E
+		t.Fatalf("expected 3 POSTs before expiry, got %d\n%v", out.NumConsumePOST, dumpEvents(out))
+	}
+	if !out.GaveUp || out.GiveUpReason != "target expired before consume; no substitute" {
+		t.Fatalf("expected expiry abandon, got gaveUp=%v reason=%q", out.GaveUp, out.GiveUpReason)
+	}
+}
+
+// TestChangedExpiryStillPresent_NotConsumed: the target row survives with a
+// changed (now past) expiry and status still available. Verification reads
+// raw rows, so the same ID is present and nothing counts as consumed.
+func TestChangedExpiryStillPresent_NotConsumed(t *testing.T) {
+	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
+	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour, PostResetDelay: time.Minute}
+	client := newClient("c1", E, 20)
+	client.ConsumeCode = "reset"
+	client.OnConsumeReset = func(id string) {
+		client.Credits[id].ExpiresAt = E.Add(-24 * time.Hour) // moved into the past, still available
+		client.WeeklyPct = 100
+	}
+	out := Run(cfg, client, E.Add(-12*time.Hour), 2*24*time.Hour)
+	if !out.GaveUp {
+		t.Fatalf("a still-present target must not verify as consumed\n%v", dumpEvents(out))
+	}
 }

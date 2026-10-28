@@ -23,11 +23,18 @@ type PluginState struct {
 // AccountRuntime is the persisted per-account FSM snapshot. Only the fields
 // needed to resume scheduling are stored; transient step state is not.
 type AccountRuntime struct {
-	AuthID       string       `json:"auth_id"`
-	State        State        `json:"state"`
-	NextWake     time.Time    `json:"next_wake"`
-	Attempt      ResetAttempt `json:"attempt,omitempty"`
-	LastSnapshot Snapshot     `json:"last_snapshot,omitempty"`
+	AuthID   string       `json:"auth_id"`
+	State    State        `json:"state"`
+	NextWake time.Time    `json:"next_wake"`
+	Attempt  ResetAttempt `json:"attempt,omitempty"`
+	// AutoHold blocks new automatic cycles after an unresolved verification.
+	// Persists across restarts; cleared only when a later verification
+	// succeeds or an operator's manual attempt resolves.
+	AutoHold bool `json:"auto_hold,omitempty"`
+	// HoldRecoveryOnly marks a hold whose credit consumption is confirmed and
+	// only weekly recovery is pending (the only read-only-resolvable kind).
+	HoldRecoveryOnly bool     `json:"hold_recovery_only,omitempty"`
+	LastSnapshot     Snapshot `json:"last_snapshot,omitempty"`
 }
 
 // saveState writes state atomically: marshal → write to <path>.tmp → rename.

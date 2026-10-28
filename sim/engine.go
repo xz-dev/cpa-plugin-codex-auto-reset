@@ -11,15 +11,15 @@ import (
 
 // Config holds the user-tunable parameters. Defaults match the design spec.
 type Config struct {
-	RefreshInterval    time.Duration // R: IDLE patrol cadence
-	TriggerLeadTime    time.Duration // L: redeem this long before expiry
-	PostResetDelay     time.Duration // hardcoded: verify delay after POST
+	RefreshInterval time.Duration // R: IDLE patrol cadence
+	TriggerLeadTime time.Duration // L: redeem this long before expiry
+	PostResetDelay  time.Duration // hardcoded: verify delay after POST
 }
 
 func DefaultConfig() Config {
 	return Config{
-		RefreshInterval: 12 * time.Hour,
-		TriggerLeadTime: 6 * time.Hour,
+		RefreshInterval: 1 * time.Hour,
+		TriggerLeadTime: 5 * time.Minute,
 		PostResetDelay:  1 * time.Minute,
 	}
 }
@@ -56,12 +56,12 @@ type FakeOpenAIClient struct {
 	ListCalls      int
 	UsageCalls     int
 	ConsumedCalls  int
-	ConsumedIDs    []string               // ordered list of credit_ids POSTed to /consume
-	RedeemRequests []string               // ordered redeem_request_ids seen
-	Credits        map[string]*Credit     // live credit store, keyed by id
-	WeeklyPct      int                    // current weekly quota %
-	ConsumeCode    string                 // code to return on POST: "reset"/"already_redeemed"/"no_credit"/"nothing_to_reset"
-	WindowsReset   int                    // windows_reset value to return
+	ConsumedIDs    []string           // ordered list of credit_ids POSTed to /consume
+	RedeemRequests []string           // ordered redeem_request_ids seen
+	Credits        map[string]*Credit // live credit store, keyed by id
+	WeeklyPct      int                // current weekly quota %
+	ConsumeCode    string             // code to return on POST: "reset"/"already_redeemed"/"no_credit"/"nothing_to_reset"
+	WindowsReset   int                // windows_reset value to return
 	ListErr        error
 	// FailFirstN, if > 0, makes the next N consume calls return this error
 	// BEFORE applying the server-side deduction. Lets tests script transient
@@ -93,6 +93,22 @@ func (c *FakeOpenAIClient) list(now time.Time) Snapshot {
 	avail := 0
 	for _, cr := range credits {
 		if cr.Status == "available" {
+			avail++
+		}
+	}
+	return Snapshot{AvailableCount: avail, Credits: credits, WeeklyPct: c.WeeklyPct}
+}
+
+// listAll mirrors production ListAllCredits: every returned record, no local
+// expiry/status filter, so verification judges the pinned target by raw ID.
+// AvailableCount stays the server-side count of live available credits.
+func (c *FakeOpenAIClient) listAll(now time.Time) Snapshot {
+	c.ListCalls++
+	credits := make([]Credit, 0, len(c.Credits))
+	avail := 0
+	for _, cr := range c.Credits {
+		credits = append(credits, *cr)
+		if cr.Status == "available" && (cr.ExpiresAt.IsZero() || cr.ExpiresAt.After(now)) {
 			avail++
 		}
 	}
@@ -142,11 +158,11 @@ const (
 
 // Event is one recorded step in the simulation.
 type Event struct {
-	Time    time.Time
-	Type    EventType
-	State   State
-	Detail  string
-	Next    *time.Time // scheduled next wake, if any
+	Time   time.Time
+	Type   EventType
+	State  State
+	Detail string
+	Next   *time.Time // scheduled next wake, if any
 }
 
 // Outcome is what assertions run against.
@@ -171,6 +187,7 @@ type accountFSM struct {
 	state     State
 	redeemID  string
 	targetID  string
+	targetExp time.Time // pinned expected expiry at confirm time
 	preSnap   Snapshot
 	attempt   int
 	nextRetry time.Time
@@ -310,6 +327,7 @@ func (f *accountFSM) stepCONFIRMING() time.Time {
 		return T
 	}
 	f.preSnap = snap
+	f.targetExp = target.ExpiresAt
 	f.redeemID = fmt.Sprintf("rrid-%d-%s", f.out.NumConsumePOST+1, target.ID)
 	f.attempt = 0
 	f.state = StateRESETTING
@@ -318,6 +336,15 @@ func (f *accountFSM) stepCONFIRMING() time.Time {
 }
 
 func (f *accountFSM) stepRESETTING() time.Time {
+	// Mirrors production: never consume against an expired pinned target and
+	// never substitute another credit within the cycle.
+	if !f.targetExp.IsZero() && !f.now.Before(f.targetExp) {
+		f.state = StateDONE
+		f.out.GaveUp = true
+		f.out.GiveUpReason = "target expired before consume; no substitute"
+		f.recordState(nil, "target expired before consume, abandon (read-only)")
+		return time.Time{}
+	}
 	code, wr, err := f.client.consume(f.redeemID, f.targetID)
 	f.out.NumConsumePOST = len(f.client.ConsumedIDs)
 	f.out.Events = append(f.out.Events, Event{Time: f.now, Type: EvHTTPConsume, State: f.state, Detail: fmt.Sprintf("POST redeem=%s credit=%s code=%q wr=%d err=%v", f.redeemID, f.targetID, code, wr, err)})
@@ -358,21 +385,43 @@ func (f *accountFSM) stepRESETTING() time.Time {
 }
 
 func (f *accountFSM) stepVERIFYING() time.Time {
-	// Re-confirm before verifying (§5.4 spirit): re-list, then judge.
-	snap := f.client.list(f.now)
+	// Re-confirm before verifying (§5.4 spirit): re-list (unfiltered, like
+	// production), then judge.
+	snap := f.client.listAll(f.now)
 	f.out.NumListCalls = f.client.ListCalls
 	usage := f.client.usage()
 	f.out.NumUsageCalls = f.client.UsageCalls
 	f.out.Events = append(f.out.Events, Event{Time: f.now, Type: EvHTTPList, State: f.state, Detail: fmt.Sprintf("verify list available=%d", snap.AvailableCount)})
 	f.out.Events = append(f.out.Events, Event{Time: f.now, Type: EvHTTPUsage, State: f.state, Detail: fmt.Sprintf("verify usage weekly=%d%%", usage.WeeklyPct)})
 
-	// Triple deduction check.
+	// Consumption receipt (same semantics as production): the pinned target is
+	// consumed when it no longer appears as an available credit — absent, or
+	// retained with a redeemed status. Unknown other statuses are
+	// inconclusive; expiry-explained absence is inconclusive.
 	targetGone := true
+	targetInconclusive := false
+	rowFound := false
 	for _, cr := range snap.Credits {
-		if cr.ID == f.targetID && cr.Status == "available" {
-			targetGone = false
-			break
+		if cr.ID != f.targetID {
+			continue
 		}
+		rowFound = true
+		switch {
+		case cr.Status == "available":
+			targetGone = false
+		case cr.Status == "redeemed":
+			// retained redeemed row still proves consumption
+		default:
+			targetGone = false
+			targetInconclusive = true
+		}
+	}
+	// Absence is expiry-explained (inconclusive) when the pinned expected
+	// expiry already passed at verification time.
+	// A retained redeemed row is direct evidence and is never expiry-explained.
+	if targetGone && !rowFound && !f.targetExp.IsZero() && !f.targetExp.After(f.now) {
+		targetGone = false
+		targetInconclusive = true
 	}
 	countDown1 := snap.AvailableCount == f.preSnap.AvailableCount-1
 	quotaRecovered := usage.WeeklyPct >= 100 || usage.WeeklyPct > f.preSnap.WeeklyPct
@@ -386,8 +435,8 @@ func (f *accountFSM) stepVERIFYING() time.Time {
 		f.recordState(nil, fmt.Sprintf("verify PARTIAL count ok but weekly %d%%->%d%% (delayed?)", f.preSnap.WeeklyPct, usage.WeeklyPct))
 	default:
 		f.out.GaveUp = true
-		f.out.GiveUpReason = fmt.Sprintf("verification mismatch (targetGone=%v countDown1=%v quotaRecovered=%v)", targetGone, countDown1, quotaRecovered)
-		f.recordState(nil, fmt.Sprintf("verify MISMATCH targetGone=%v countDown1=%v quotaUp=%v — halt", targetGone, countDown1, quotaRecovered))
+		f.out.GiveUpReason = fmt.Sprintf("verification mismatch (consumed=%v inconclusive=%v countDown1=%v quotaRecovered=%v)", targetGone, targetInconclusive, countDown1, quotaRecovered)
+		f.recordState(nil, fmt.Sprintf("verify MISMATCH consumed=%v inconclusive=%v countDown1=%v quotaUp=%v — halt", targetGone, targetInconclusive, countDown1, quotaRecovered))
 	}
 	return time.Time{}
 }

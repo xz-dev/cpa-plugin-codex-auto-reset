@@ -65,7 +65,7 @@ func TestClassifyConsume_ErrorClassification(t *testing.T) {
 		{"5xx_server_error", &HTTPStatusError{Code: 502}, decisionRetry},
 		{"5xx_gateway_timeout", &HTTPStatusError{Code: 504}, decisionRetry},
 		{"plain_network_error", netErr{}, decisionRetry},
-		{"wrapped_network_error", errors.New("wrapped: "+(netErr{}).Error()), decisionRetry},
+		{"wrapped_network_error", errors.New("wrapped: " + (netErr{}).Error()), decisionRetry},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

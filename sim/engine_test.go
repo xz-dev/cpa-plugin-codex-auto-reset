@@ -13,8 +13,8 @@ func newClient(creditID string, expiresAt time.Time, preWeekly int) *FakeOpenAIC
 		Credits: map[string]*Credit{
 			creditID: {ID: creditID, Status: "available", ExpiresAt: expiresAt},
 		},
-		WeeklyPct:   preWeekly,
-		ConsumeCode: "reset",
+		WeeklyPct:    preWeekly,
+		ConsumeCode:  "reset",
 		WindowsReset: 2,
 	}
 	c.OnConsumeReset = func(consumedID string) {
@@ -48,14 +48,14 @@ func TestMatrix_AllRelations(t *testing.T) {
 		// Non-integer-multiple relations — these stress IDLE patrol phase
 		// alignment against M and T, where patrol landings do not coincide
 		// with neat multiples of R.
-		{"R_gt_L_5_3", 5 * time.Hour, 3 * time.Hour},              // R>L, coprime hours
-		{"R_gt_L_7_5", 7 * time.Hour, 5 * time.Hour},              // R>L, coprime
-		{"R_gt_L_8_6", 8 * time.Hour, 6 * time.Hour},              // R>L, non-multiple
-		{"R_gt_L_10_3", 10 * time.Hour, 3 * time.Hour},            // R>>L
-		{"R_lt_L_3_5", 3 * time.Hour, 5 * time.Hour},              // R<L, coprime
-		{"R_lt_L_5_7", 5 * time.Hour, 7 * time.Hour},              // R<L, coprime
-		{"R_lt_L_3_10", 3 * time.Hour, 10 * time.Hour},            // R<<L
-		{"R_lt_L_7_11", 7 * time.Hour, 11 * time.Hour},            // R<L, coprime primes
+		{"R_gt_L_5_3", 5 * time.Hour, 3 * time.Hour},   // R>L, coprime hours
+		{"R_gt_L_7_5", 7 * time.Hour, 5 * time.Hour},   // R>L, coprime
+		{"R_gt_L_8_6", 8 * time.Hour, 6 * time.Hour},   // R>L, non-multiple
+		{"R_gt_L_10_3", 10 * time.Hour, 3 * time.Hour}, // R>>L
+		{"R_lt_L_3_5", 3 * time.Hour, 5 * time.Hour},   // R<L, coprime
+		{"R_lt_L_5_7", 5 * time.Hour, 7 * time.Hour},   // R<L, coprime
+		{"R_lt_L_3_10", 3 * time.Hour, 10 * time.Hour}, // R<<L
+		{"R_lt_L_7_11", 7 * time.Hour, 11 * time.Hour}, // R<L, coprime primes
 		// Sub-hour granularity to catch minute/second rounding.
 		{"R_gt_L_90min_45min", 90 * time.Minute, 45 * time.Minute},
 		{"R_lt_L_37min_61min", 37 * time.Minute, 61 * time.Minute},
@@ -67,13 +67,13 @@ func TestMatrix_AllRelations(t *testing.T) {
 		offset time.Duration // relative to E; negative = before E
 	}{
 		{"far_before_M", -48 * time.Hour}, // well before M; multiple IDLE cycles
-		{"just_before_M_7s", 0},            // filled in per-case below (needs M)
-		{"just_after_M_7s", 0},             // filled in per-case below (needs M)
-		{"inside_ARMED_window", 0},         // M < now < T
-		{"just_before_T_3min", 0},          // 3 min before T
-		{"at_T_exact", 0},                  // exactly T
-		{"past_T_before_E_2h", 0},          // 2h past T, still before E
-		{"past_E_5min", 0},                 // 5 min after expiry (credit should be filtered)
+		{"just_before_M_7s", 0},           // filled in per-case below (needs M)
+		{"just_after_M_7s", 0},            // filled in per-case below (needs M)
+		{"inside_ARMED_window", 0},        // M < now < T
+		{"just_before_T_3min", 0},         // 3 min before T
+		{"at_T_exact", 0},                 // exactly T
+		{"past_T_before_E_2h", 0},         // 2h past T, still before E
+		{"past_E_5min", 0},                // 5 min after expiry (credit should be filtered)
 		// Non-multiple stress phases: simulate IDLE patrol rhythms that don't
 		// align with M or T. These are filled in per-case below.
 		{"patrol_lands_13s_before_M", 0}, // a patrol wake 13s before M -> next wake is after M, arms
@@ -253,11 +253,11 @@ func TestMultipleCredits_PicksSoonestExpiring(t *testing.T) {
 
 	client := &FakeOpenAIClient{
 		Credits: map[string]*Credit{
-			"later":   {ID: "later", Status: "available", ExpiresAt: E2},
-			"sooner":  {ID: "sooner", Status: "available", ExpiresAt: E1},
+			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
+			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
 		},
-		WeeklyPct:   10,
-		ConsumeCode: "reset",
+		WeeklyPct:    10,
+		ConsumeCode:  "reset",
 		WindowsReset: 2,
 	}
 	client.OnConsumeReset = func(id string) {

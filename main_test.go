@@ -138,7 +138,7 @@ func TestResolveStatePath_Precedence(t *testing.T) {
 		{AuthIndex: "runtime-only"}, // no Path — skipped
 		{AuthIndex: "codex-1", Path: filepath.Join(authDir, "codex-1.json")},
 	}
-	derived := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.json")
+	derived := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.data")
 	cases := []struct {
 		name     string
 		stateDir string
@@ -171,9 +171,13 @@ func TestResolveStatePath_PlacesStateUnderAuthDir(t *testing.T) {
 		{AuthIndex: "a", Path: filepath.Join(authDir, "codex-team.json")},
 	}
 	got := resolveStatePath("", entries)
-	want := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.json")
+	want := filepath.Join(authDir, "plugin-state", "codex-auto-reset", "state.data")
 	if got != want {
 		t.Fatalf("state not under auth dir: got %q want %q", got, want)
+	}
+	// CPA loads every *.json under the auth dir as an auth file.
+	if strings.HasSuffix(got, ".json") {
+		t.Fatalf("auth-dir state must not be *.json: %q", got)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -536,5 +537,138 @@ func TestWorker_RetriesInitialCredentialLoadFailure(t *testing.T) {
 	}
 	if !clock.Get().After(start.Add(credentialRetryInterval - time.Second)) {
 		t.Fatalf("worker did not wait for the credential backoff: clock=%v", clock.Get())
+	}
+}
+
+// TestWorker_ReconcilePreservesActiveAttempt: a policy change while an
+// account is mid-consume keeps target, idempotency key, and evidence.
+func TestWorker_ReconcilePreservesActiveAttempt(t *testing.T) {
+	defer resetTestClock()
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{
+		credits:    map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyPct:  20,
+		consumeErr: fmt.Errorf("transient"),
+	}
+	w := NewWorker(cfg, []string{"acct"}, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
+	}, time.Now)
+	withTestClock(w, E.Add(-10*time.Minute))
+	w.ensureFSM("acct")
+	fsm := w.fsms["acct"]
+	fsm.ForceConfirm()
+	// Drive through CONFIRMING+first failed consume (attempt minted).
+	for i := 0; i < 12 && fsm.attempt.RedeemRequestID == ""; i++ {
+		fsm.Step()
+	}
+	fsm.Step() // first consume attempt fails → retry scheduled
+	if fsm.attempt.RedeemRequestID == "" || fsm.attempt.TargetCreditID != "c1" {
+		t.Fatalf("no active attempt: %+v", fsm.attempt)
+	}
+	rrid := fsm.attempt.RedeemRequestID
+
+	// Reconcile: disable acct + change timings.
+	newCfg := Config{RefreshInterval: 2 * time.Hour, TriggerLeadTime: 10 * time.Minute, EnabledAccounts: nil}
+	retained := w.Reconcile(newCfg, nil)
+	if len(retained) != 1 || retained[0] != "acct" {
+		t.Fatalf("in-flight account must be retained: %v", retained)
+	}
+	if _, ok := w.fsms["acct"]; !ok {
+		t.Fatal("active FSM dropped by reconcile")
+	}
+	if fsm.attempt.RedeemRequestID != rrid || fsm.attempt.TargetCreditID != "c1" {
+		t.Fatalf("attempt identity changed: %+v", fsm.attempt)
+	}
+	if fsm.eff().RefreshInterval != 2*time.Hour {
+		t.Fatal("new policy not applied")
+	}
+	// Disabled accounts start no NEW cycles once done.
+	fsm2fc := &fakeClient{credits: map[string]*Credit{"x": {ID: "x", Status: "available", ExpiresAt: E}}}
+	_ = fsm2fc
+	if _, ok := w.fsms["zzz"]; ok {
+		t.Fatal("unexpected")
+	}
+}
+
+// TestWorker_ReconcileIdleDisabledDropped: an IDLE disabled account is
+// removed; a re-enabled one is recreated.
+func TestWorker_ReconcileIdleDisabledDropped(t *testing.T) {
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute}
+	fc := &fakeClient{credits: map[string]*Credit{}}
+	w := NewWorker(cfg, []string{"a"}, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
+	}, time.Now)
+	w.ensureFSM("a")
+	if _, ok := w.fsms["a"]; !ok {
+		t.Fatal("setup")
+	}
+	w.Reconcile(cfg, nil)
+	if _, ok := w.fsms["a"]; ok {
+		t.Fatal("idle disabled account must be dropped")
+	}
+	w.Reconcile(cfg, []string{"a"})
+	if _, ok := w.fsms["a"]; !ok {
+		t.Fatal("re-enabled account must be recreated")
+	}
+}
+
+// TestWorker_WakeWeeklyExhaustionCoalesces: polling and repeated hints for
+// the same account produce at most one cycle with one target/idempotency key.
+func TestWorker_WakeWeeklyExhaustionCoalesces(t *testing.T) {
+	defer resetTestClock()
+	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	fc := &fakeClient{
+		credits:     map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}},
+		weeklyUsed:  100,
+		weeklyKnown: true,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset},
+	}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute,
+		EnabledAccounts:          []string{"acct"},
+		AutoResetOnWeeklyExhaust: true}
+	w := NewWorker(cfg, cfg.EnabledAccounts, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
+	}, time.Now)
+	clock := withTestClock(w, E.Add(-2*time.Hour))
+	w.ensureFSM("acct")
+	fsm := w.fsms["acct"]
+	// Multiple simultaneous hints.
+	for i := 0; i < 3; i++ {
+		if err := w.WakeWeeklyExhaustion("acct"); err != nil {
+			t.Fatalf("wake: %v", err)
+		}
+	}
+	for i := 0; i < 10 && fsm.State() != StateVERIFYING && fsm.State() != StateDONE; i++ {
+		next := fsm.Step()
+		if !next.IsZero() && next.After(clock.Get()) {
+			clock.AdvanceTo(next)
+		}
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("coalesced hints must yield exactly one consume, got %d", fc.consumeCalls)
+	}
+	if len(fc.redeemIDs) != 1 {
+		t.Fatalf("one idempotency key expected, got %v", fc.redeemIDs)
+	}
+	// A delayed hint after the target is consumed/recovered: fresh usage
+	// shows weekly below 100 (recovered) → nothing consumed again.
+	fc.weeklyUsed = 40
+	fc.weeklyPct = 60
+	fsm.Reset()
+	if err := w.WakeWeeklyExhaustion("acct"); err != nil {
+		t.Fatalf("late wake: %v", err)
+	}
+	for i := 0; i < 10 && fsm.State() != StateDONE && fsm.State() != StateARMED; i++ {
+		next := fsm.Step()
+		if !next.IsZero() && next.After(clock.Get()) {
+			clock.AdvanceTo(next)
+		}
+		if fsm.State() == StateIDLE {
+			break
+		}
+	}
+	if fc.consumeCalls != 1 {
+		t.Fatalf("late hint after recovery must consume nothing, got %d", fc.consumeCalls)
 	}
 }

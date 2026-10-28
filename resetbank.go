@@ -12,8 +12,13 @@ import (
 // ResetClient is the subset of OpenAIClient that the FSM needs. Defined here
 // (next to the consumer) rather than in openai_client.go so the FSM is the
 // dependency authority. Tests inject a fake; production injects *OpenAIClient.
+// ListAllCredits returns the UNFILTERED credit records so post-consume
+// verification can decide target disappearance by identity rather than by
+// the locally availability-filtered list. Production's *OpenAIClient serves
+// it from the same wire call as ListCredits.
 type ResetClient interface {
 	ListCredits(creds CodexCredentials) (Snapshot, error)
+	ListAllCredits(creds CodexCredentials) (Snapshot, error)
 	GetUsage(creds CodexCredentials) (Snapshot, error)
 	Consume(creds CodexCredentials, redeemRequestID, creditID string) (ConsumeResponse, error)
 }
@@ -41,7 +46,26 @@ type AccountFSM struct {
 	nextWake          time.Time
 	verifyDue         time.Time
 	scheduledCreditID string
+	scheduledExpiry   time.Time
 	manualReset       bool
+	// weeklyWake is set by WakeWeeklyExhaustion when a coalesced exhaustion
+	// hint arrives for this account. CONFIRMING consumes it to authorize an
+	// early trigger after a fresh weekly-exhaustion check.
+	weeklyWake bool
+	// autoHold blocks NEW automatic cycles (expiry/weekly) after an
+	// unresolved verification until a later verification succeeds or an
+	// operator explicitly runs a manual attempt that resolves. It is durable
+	// evidence — persisted in AccountRuntime — and never cleared by reset.
+	autoHold bool
+	// holdRecoveryOnly marks a hold whose target consumption is already
+	// confirmed and only quota recovery is pending; only that kind may be
+	// resolved read-only by observing recovered weekly usage.
+	holdRecoveryOnly bool
+	// PersistAttempt, when non-nil, durably records a new attempt's identity
+	// (target, expiry, idempotency key, pre-snapshot) BEFORE the first consume.
+	// Called with mu held; it must not call back into the FSM. An error blocks
+	// spending for this cycle.
+	PersistAttempt func(a ResetAttempt) error
 	// testPostStep, when non-nil, runs inside StepAndSettle after the tick
 	// but BEFORE the settle decision, with mu still held. Tests use it to
 	// prove that a concurrent ForceConfirm/TriggerCheck cannot interleave
@@ -57,6 +81,7 @@ type AccountFSM struct {
 	// mirrors it into AccountRuntime so the management UI can show live
 	// credit counts, weekly %, and next expiry without an extra API call.
 	lastSnapshot Snapshot
+	holdPrior    int // hold streak at tick start; see stepLocked
 }
 
 // NewAccountFSM builds an FSM in StateIDLE, ready for its first Step().
@@ -89,6 +114,112 @@ func (f *AccountFSM) LastSnapshot() Snapshot {
 	return f.lastSnapshot
 }
 
+// Attempt returns the current attempt snapshot for durable persistence.
+// Thread-safe.
+func (f *AccountFSM) Attempt() ResetAttempt {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempt
+}
+
+// RestoreAttempt re-seeds a persisted attempt after restart so an uncertain
+// mid-cycle outcome is reconciled conservatively instead of being recreated
+// as a fresh consume. Called by the worker during FSM construction.
+func (f *AccountFSM) RestoreAttempt(a ResetAttempt) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a.RedeemRequestID != "" {
+		// Hold-release progress never survives a restart: a write that
+		// invalidated it may have failed, so start the streak over.
+		a.HoldChecks, a.HoldCheckAt, a.HoldCount = 0, time.Time{}, 0
+		f.attempt = a
+		// An in-flight (never classified) or explicitly unresolved attempt is
+		// reconciled read-only through verification instead of letting
+		// CONFIRMING mint a new key. A classified held attempt stays IDLE
+		// under its hold. Call after SetAutoHold.
+		if a.Reverify || !f.autoHold {
+			f.state = StateVERIFYING
+			f.verifyDue = f.now()
+		}
+	}
+}
+
+// SetAutoHold seeds the automatic-spending hold from persisted runtime state.
+func (f *AccountFSM) SetAutoHold(hold, recoveryOnly bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.autoHold = hold
+	f.holdRecoveryOnly = hold && recoveryOnly
+}
+
+// HoldRecoveryOnly reports whether the active hold only awaits quota recovery
+// of an already-confirmed consumption. Thread-safe.
+func (f *AccountFSM) HoldRecoveryOnly() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.holdRecoveryOnly
+}
+
+// setHold engages the automatic-spending hold. Caller holds mu.
+func (f *AccountFSM) setHold(recoveryOnly bool) {
+	f.autoHold = true
+	f.holdRecoveryOnly = recoveryOnly
+}
+
+// stableHoldCheck evaluates the single raw credit read of a held IDLE patrol
+// and reports whether holdStableChecks consecutive stable checks have now been
+// seen. Only this function can carry the hold streak forward: stepLocked
+// zeroes it at the start of every tick, so any tick that fails, panics, takes
+// another path, or observes instability ends with the streak at zero. A stable
+// check inside the spacing window keeps the streak; one more than
+// holdCheckMinGap after the previous counted check advances it. Stable means:
+// no row shows an in-flight redemption, available_count is unchanged since the
+// first counted check, and normal weekly usage is known and not exhausted (so
+// release cannot immediately trigger compensation). Caller holds mu.
+func (f *AccountFSM) stableHoldCheck(now time.Time, weeklyOK bool, raw Snapshot) bool {
+	a := &f.attempt
+	prior := f.holdPrior
+	stable := weeklyOK && !(prior > 0 && raw.AvailableCount != a.HoldCount)
+	for _, c := range raw.Credits {
+		if c.InFlight() {
+			stable = false
+		}
+	}
+	switch {
+	case !stable:
+		a.HoldChecks, a.HoldCheckAt = 0, time.Time{}
+	case prior == 0:
+		a.HoldChecks, a.HoldCheckAt, a.HoldCount = 1, now, raw.AvailableCount
+	case now.Sub(a.HoldCheckAt) > holdCheckMinGap:
+		a.HoldChecks, a.HoldCheckAt = prior+1, now
+	default:
+		a.HoldChecks = prior // stable, but too soon to count
+	}
+	return a.HoldChecks >= holdStableChecks
+}
+
+// BreakHoldStreak discards hold-release progress after an aborted tick (for
+// example a credential load failure) that never reached the FSM.
+func (f *AccountFSM) BreakHoldStreak() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempt.HoldChecks = 0
+}
+
+// holdUnresolved holds automatic spending AND keeps the attempt for a later
+// read-only re-verification, because the consume outcome is unknown.
+func (f *AccountFSM) holdUnresolved() {
+	f.setHold(false)
+	f.attempt.Reverify = true
+}
+
+// AutoHold reports whether the automatic-spending hold is active.
+func (f *AccountFSM) AutoHold() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.autoHold
+}
+
 // SetNextWake lets external callers (worker's TriggerCheck) override the
 // scheduled wake. Thread-safe.
 func (f *AccountFSM) SetNextWake(t time.Time) {
@@ -111,6 +242,29 @@ func (f *AccountFSM) ForceConfirm() {
 	f.nextWake = f.now()
 }
 
+// WakeWeeklyExhaustion coalesces an exhaustion hint for this account: pulls an
+// IDLE FSM to an immediate patrol (CONFIRMING will freshly re-check before
+// consuming) and wakes an ARMED FSM to confirm early under weekly-exhaustion
+// rules. Active consume/verify keeps its schedule. Returns nothing; the
+// worker owns the actual loop wake.
+func (f *AccountFSM) WakeWeeklyExhaustion() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == StateRESETTING || f.state == StateVERIFYING || f.state == StateCONFIRMING {
+		return
+	}
+	if f.autoHold {
+		// A held account only reconciles read-only: route the hint through
+		// the IDLE patrol so every observation updates the hold streak.
+		f.state = StateIDLE
+		f.nextWake = f.now()
+		return
+	}
+	f.weeklyWake = true
+	f.state = StateCONFIRMING
+	f.nextWake = f.now()
+}
+
 // Step executes one FSM tick at f.Now() and returns the next scheduled wake.
 // Returns zero time when the cycle terminated (DONE). The automatic flow
 // mirrors sim/engine.go's step(), covering (R, L) relations and edge cases.
@@ -129,6 +283,9 @@ func (f *AccountFSM) Step() time.Time {
 }
 
 func (f *AccountFSM) stepLocked() time.Time {
+	// Pessimistic hold streak: zero it before anything can observe upstream;
+	// only a stable held IDLE patrol (stableHoldCheck) restores or advances it.
+	f.holdPrior, f.attempt.HoldChecks = f.attempt.HoldChecks, 0
 	switch f.state {
 	case StateIDLE:
 		return f.stepIDLE()
@@ -166,7 +323,7 @@ func (f *AccountFSM) StepAndSettle() time.Time {
 	}
 	if wake.IsZero() && f.state == StateDONE {
 		f.resetLocked()
-		wake = f.now().Add(f.Cfg.RefreshInterval)
+		wake = f.now().Add(f.eff().RefreshInterval)
 	}
 	f.nextWake = wake
 	return wake
@@ -179,11 +336,30 @@ func (f *AccountFSM) now() time.Time {
 	return time.Now()
 }
 
+// eff returns the account's effective policy (global + saved sparse
+// override). Called per step so in-place policy reconciliation takes effect
+// on the next scheduling decision without recreating the FSM.
+func (f *AccountFSM) eff() EffectivePolicy { return f.Cfg.EffectivePolicy(f.AuthID) }
+
+// SetPolicy swaps the FSM's config in place during reconciliation. The
+// attempt identity, pinned target, and snapshots are untouched; new timings
+// apply to subsequent scheduling decisions. Must be called under mu or from
+// the worker goroutine context that owns the FSM.
+func (f *AccountFSM) SetPolicy(cfg Config) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Cfg = cfg
+}
+
 // triggerTime returns T = E - L (the moment the trigger window opens).
-func (f *AccountFSM) triggerTime(c Credit) time.Time { return c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime) }
+func (f *AccountFSM) triggerTime(c Credit) time.Time {
+	return c.ExpiresAt.Add(-f.eff().TriggerLeadTime)
+}
 
 // armThreshold returns M = T - R (the moment we enter ARMED).
-func (f *AccountFSM) armThreshold(c Credit) time.Time { return f.triggerTime(c).Add(-f.Cfg.RefreshInterval) }
+func (f *AccountFSM) armThreshold(c Credit) time.Time {
+	return f.triggerTime(c).Add(-f.eff().RefreshInterval)
+}
 
 func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, details map[string]any) {
 	if f.Logf != nil {
@@ -193,9 +369,13 @@ func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, detai
 
 func (f *AccountFSM) stepIDLE() time.Time {
 	now := f.now()
-	snap, err := f.Client.ListCredits(f.Creds)
+	// One raw read per patrol; the available view is derived locally so a
+	// held account's reconciliation sees every row (e.g. in-flight ones).
+	snap, err := f.Client.ListAllCredits(f.Creds)
+	raw := snap
+	snap.Credits = availableCreditsSorted(snap.Credits, now)
 	if err != nil {
-		next := now.Add(f.Cfg.RefreshInterval)
+		next := now.Add(f.eff().RefreshInterval)
 		f.nextWake = next
 		f.log("warn", fmt.Sprintf("list failed: %v", err), "retry patrol", &next, nil)
 		return next
@@ -203,30 +383,89 @@ func (f *AccountFSM) stepIDLE() time.Time {
 	f.lastSnapshot = snap // mirror into the UI-facing snapshot
 	// Also fetch weekly % so the UI card can display it. The /rate-limit-
 	// reset-credits endpoint doesn't return weekly %, so we need /usage.
-	if usage, err := f.Client.GetUsage(f.Creds); err == nil {
+	usage, usageErr := f.Client.GetUsage(f.Creds)
+	if usageErr == nil {
 		snap.WeeklyPct = usage.WeeklyPct
+		snap.WeeklyUsedPct = usage.WeeklyUsedPct
+		snap.WeeklyKnown = usage.WeeklyKnown
 		f.lastSnapshot = snap
+	}
+	if f.attempt.Reverify && f.attempt.RedeemRequestID != "" {
+		// An earlier consume outcome is unknown: re-run read-only
+		// verification of that same attempt; never start a new cycle.
+		f.state = StateVERIFYING
+		f.nextWake = now
+		f.log("warn", "re-verifying unresolved reset attempt (read-only)", "verify", nil,
+			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "credit_id": f.attempt.TargetCreditID})
+		return now
+	}
+	if f.autoHold {
+		// Read-only reconciliation. A "consumed, recovery pending" hold
+		// resolves when this attempt's own recovery predicate (same as
+		// verification, against its pre-reset snapshot) holds. Any other
+		// classified hold resolves after holdStableChecks consecutive
+		// read-only checks more than holdCheckMinGap apart (operator choice:
+		// tolerate network jitter, avoid permanent manual-only holds).
+		var released bool
+		var why string
+		if f.holdRecoveryOnly {
+			released = f.attempt.RedeemRequestID != "" && usageErr == nil && usage.WeeklyKnown &&
+				(usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
+			why = fmt.Sprintf("weekly quota recovered (%d%% remaining)", usage.WeeklyPct)
+		} else {
+			released = f.stableHoldCheck(now, usageErr == nil && usage.WeeklyKnown && !usage.WeeklyExhausted(), raw)
+			why = fmt.Sprintf("%d stable read-only checks", holdStableChecks)
+		}
+		if !released {
+			next := now.Add(f.eff().RefreshInterval)
+			f.nextWake = next
+			f.log("warn", "automatic spending held: previous reset outcome unresolved", "patrol only (hold)", &next,
+				map[string]any{"stable_checks": f.attempt.HoldChecks})
+			return next
+		}
+		if f.holdRecoveryOnly && f.attempt.RedeemRequestID != "" {
+			// Upgrade the earlier "recovery pending" history record in place.
+			f.pendingHistory = &ResetRecord{
+				Timestamp: now, AuthID: f.AuthID, CreditID: f.attempt.TargetCreditID,
+				Success: true, ConsumptionConfirmed: true, RecoveryConfirmed: true,
+				CycleReason: f.attempt.CycleReason, PreWeeklyPct: f.attempt.PreSnapshot.WeeklyPct,
+				PostWeeklyPct: usage.WeeklyPct, PreCredits: f.attempt.PreSnapshot.AvailableCount,
+				PostCredits: snap.AvailableCount, ResolvesEarlier: true,
+			}
+		}
+		f.autoHold, f.holdRecoveryOnly = false, false
+		f.attempt = ResetAttempt{}
+		f.log("info", "automatic-spending hold resolved: "+why, "patrol", nil, nil)
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
 	if len(avail) == 0 {
-		next := now.Add(f.Cfg.RefreshInterval)
+		next := now.Add(f.eff().RefreshInterval)
 		f.nextWake = next
 		f.log("info", "no available credits", "patrol", &next, nil)
 		return next
 	}
+	if f.eff().AutoResetOnWeeklyExhaust && usageErr == nil && usage.WeeklyExhausted() {
+		// Periodic patrol found weekly exhaustion without a failure hint; the
+		// same CONFIRMING path re-checks freshly before any consume.
+		f.weeklyWake = true
+		f.state = StateCONFIRMING
+		f.nextWake = now
+		f.log("warn", "patrol found normal weekly quota exhausted; confirming", "confirm before reset", nil, nil)
+		return now
+	}
 	target := avail[0]
 	if target.ExpiresAt.IsZero() {
-		next := now.Add(f.Cfg.RefreshInterval)
+		next := now.Add(f.eff().RefreshInterval)
 		f.nextWake = next
 		f.log("info", "no expiring credits to schedule", "patrol", &next, nil)
 		return next
 	}
 	M := f.armThreshold(target)
 	if now.Before(M) {
-		next := now.Add(f.Cfg.RefreshInterval)
+		next := now.Add(f.eff().RefreshInterval)
 		f.nextWake = next
 		f.log("info",
-			fmt.Sprintf("credit %s expires in %s; not near trigger window (will arm %s before expiry point)", shortID(target.ID), target.ExpiresAt.Sub(now).Round(time.Hour), f.Cfg.RefreshInterval),
+			fmt.Sprintf("credit %s expires in %s; not near trigger window (will arm %s before expiry point)", shortID(target.ID), target.ExpiresAt.Sub(now).Round(time.Hour), f.eff().RefreshInterval),
 			"patrol", &next,
 			map[string]any{"credit_id": target.ID, "expires_at": target.ExpiresAt})
 		return next
@@ -235,6 +474,7 @@ func (f *AccountFSM) stepIDLE() time.Time {
 	// spec §4.2.1). ARMED does NO extra GETs; it just transitions on wake.
 	T := f.triggerTime(target)
 	f.scheduledCreditID = target.ID
+	f.scheduledExpiry = target.ExpiresAt
 	f.state = StateARMED
 	wake := T
 	if !now.Before(T) {
@@ -258,6 +498,11 @@ func (f *AccountFSM) stepARMED() time.Time {
 
 func (f *AccountFSM) stepCONFIRMING() time.Time {
 	now := f.now()
+	// Consume any coalesced weekly-exhaustion hint BEFORE re-validating. The
+	// hint alone never authorizes a consume — a fresh usage check below must
+	// prove normal weekly used >= 100 (unrounded).
+	weeklyHint := f.weeklyWake
+	f.weeklyWake = false
 	snap, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
 		f.state = StateDONE
@@ -278,54 +523,110 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			}
 		}
 	}
+	if f.scheduledCreditID == "" && !f.manualReset && weeklyHint && len(avail) > 0 {
+		// No pinned cycle: a weekly-exhaustion wake-up selects the
+		// soonest-expiring available credit using the existing ordering.
+		// A pinned but missing target is never substituted.
+		target = avail[0]
+	}
 	if target.ID == "" {
 		f.state = StateDONE
 		f.log("warn", "target credit missing or unavailable before reset", "abandon", nil, nil)
 		return time.Time{}
 	}
-	if !f.manualReset {
-		if target.ExpiresAt.IsZero() {
-			f.state = StateDONE
-			f.log("info", "target credit no longer expires", "abandon", nil, nil)
-			return time.Time{}
-		}
-		T := f.triggerTime(target)
-		if now.Before(T) {
-			f.state = StateARMED
-			f.nextWake = T
-			f.log("info", "target credit not yet due; re-armed", "sleep to trigger time", &T,
-				map[string]any{"credit_id": target.ID, "T": T})
-			return T
-		}
-	}
-	// Fetch usage separately so PreSnapshot.WeeklyPct carries a real value.
-	// The reset-credits endpoint does NOT return weekly % (parseResetCreditsResponse
-	// sets WeeklyPct=-1); without this call, the triple-check's quota leg
-	// (quotaUp) would be trivially true (any value > -1) and the safety
-	// invariant would degrade to a two-leg check. Spec §4.2 mandates both calls.
-	usage, err := f.Client.GetUsage(f.Creds)
-	if err != nil {
+	// Fetch usage before the authorization decision: both the triple-check
+	// pre-snapshot AND the exhaustion proof come from the same fresh query.
+	usage, usageErr := f.Client.GetUsage(f.Creds)
+	if usageErr != nil && !f.manualReset && weeklyHint {
 		f.state = StateDONE
-		f.log("error", fmt.Sprintf("confirm usage failed: %v", err), "abandon", nil, nil)
+		f.log("warn", fmt.Sprintf("weekly-exhaustion wake but usage check failed: %v", usageErr), "abandon", nil, nil)
 		return time.Time{}
 	}
-	snap.WeeklyPct = usage.WeeklyPct
+	if usageErr == nil {
+		snap.WeeklyPct = usage.WeeklyPct
+		snap.WeeklyUsedPct = usage.WeeklyUsedPct
+		snap.WeeklyKnown = usage.WeeklyKnown
+	}
+	// Determine the cycle reason. manualReset stays the operator bypass.
+	// Otherwise expiry-driven until proven otherwise; an early trigger
+	// (before T) is allowed only by fresh, unrounded weekly-exhaustion
+	// evidence under an effective opt-in. An unresolved-outcome hold blocks
+	// every automatic reason — only explicit manual authorization passes.
+	reason := CycleReasonExpiry
+	if f.manualReset {
+		reason = CycleReasonManual
+	}
+	if !f.manualReset && f.autoHold {
+		f.state = StateDONE
+		f.log("warn", "automatic cycle blocked: previous reset outcome unresolved (manual authorization required)", "abandon", nil, nil)
+		return time.Time{}
+	}
+	if !f.manualReset {
+		expiring := !target.ExpiresAt.IsZero()
+		T := f.triggerTime(target)
+		weeklyOK := f.eff().AutoResetOnWeeklyExhaust && usageErr == nil && usage.WeeklyExhausted()
+		switch {
+		case expiring && !now.Before(T):
+			// Expiry trigger reached: reason stays expiry.
+		case weeklyOK:
+			reason = CycleReasonWeeklyExhaustion
+		case expiring && f.scheduledCreditID == target.ID:
+			f.state = StateARMED
+			f.nextWake = T
+			note := "target credit not yet due; re-armed"
+			if weeklyHint {
+				note = "weekly-exhaustion wake but fresh usage cannot confirm normal weekly >=100%; re-armed for expiry"
+			}
+			f.log("info", note, "sleep to trigger time", &T,
+				map[string]any{"credit_id": target.ID, "T": T, "weekly_exhaust_opt_in": f.eff().AutoResetOnWeeklyExhaust})
+			return T
+		default:
+			// No pinned expiry cycle and no proven weekly exhaustion (or a
+			// non-expiring target): back to normal patrol.
+			f.state = StateDONE
+			f.log("info", "no automatic authorization for target credit; back to patrol", "abandon", nil,
+				map[string]any{"credit_id": target.ID, "weekly_exhaust_opt_in": f.eff().AutoResetOnWeeklyExhaust})
+			return time.Time{}
+		}
+	}
+	if usageErr != nil {
+		f.state = StateDONE
+		f.log("error", fmt.Sprintf("confirm usage failed: %v", usageErr), "abandon", nil, nil)
+		return time.Time{}
+	}
 	f.attempt = ResetAttempt{
 		RedeemRequestID: uuid.NewString(),
 		TargetCreditID:  target.ID,
+		TargetExpiresAt: target.ExpiresAt,
+		CycleReason:     reason,
 		PreSnapshot:     snap,
 		StartedAt:       now,
 		Attempt:         0,
+		// Unclassified until verification reads a fresh list; a restart in
+		// between always re-verifies, whatever hold the account inherited.
+		Reverify: true,
+	}
+	// The attempt identity must be durable before any consume can land, so a
+	// crash can only ever reconcile this attempt, never start another one.
+	if f.PersistAttempt != nil {
+		if err := f.PersistAttempt(f.attempt); err != nil {
+			f.attempt = ResetAttempt{}
+			f.state = StateDONE
+			f.log("error", fmt.Sprintf("cannot persist reset attempt, not spending: %v", err), "abandon", nil, nil)
+			return time.Time{}
+		}
 	}
 	f.state = StateRESETTING
 	f.log("info",
-		fmt.Sprintf("confirmed target credit %s (pre: credits=%d, weekly=%d%%); sending reset request",
-			shortID(target.ID), snap.AvailableCount, snap.WeeklyPct),
+		fmt.Sprintf("confirmed target credit %s (reason=%s, pre: credits=%d, weekly=%d%%); sending reset request",
+			shortID(target.ID), reason, snap.AvailableCount, snap.WeeklyPct),
 		"send reset request", nil,
 		map[string]any{
 			"credit_id":           target.ID,
+			"cycle_reason":        string(reason),
 			"pre_credits":         snap.AvailableCount,
 			"pre_weekly_pct":      snap.WeeklyPct,
+			"pre_weekly_used_pct": snap.WeeklyUsedPct,
 			"target_expires_at":   target.ExpiresAt,
 			"redeem_request_id":   f.attempt.RedeemRequestID,
 		})
@@ -334,6 +635,24 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 
 func (f *AccountFSM) stepRESETTING() time.Time {
 	now := f.now()
+	// Never send a consume against an expired pinned target, and never
+	// substitute another credit within the same cycle. If a previous consume
+	// outcome is uncertain past the expiry, reconcile read-only via the
+	// fresh post-consume list check rather than firing another request.
+	if !f.attempt.TargetExpiresAt.IsZero() && !now.Before(f.attempt.TargetExpiresAt) {
+		f.state = StateDONE
+		if f.attempt.Attempt > 0 {
+			f.holdUnresolved() // an earlier consume's outcome is unknown
+		} else {
+			defer func() { f.attempt = ResetAttempt{} }() // nothing was sent
+		}
+		f.log("warn",
+			fmt.Sprintf("target %s expired at %s before consume attempt %d; reconciling read-only, no substitute",
+				shortID(f.attempt.TargetCreditID), f.attempt.TargetExpiresAt.Format("15:04:05"), f.attempt.Attempt+1),
+			"abandon", nil,
+			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "credit_id": f.attempt.TargetCreditID})
+		return time.Time{}
+	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
 	switch classifyConsume(resp, err) {
 	case decisionSuccess:
@@ -357,12 +676,19 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		if err != nil {
 			msg = fmt.Sprintf("reset stopped: %v", err)
 		}
+		knownCode := err == nil && (resp.Code == ConsumeCodeNoCredit || resp.Code == ConsumeCodeNothingToReset)
+		if f.attempt.Attempt == 0 && (err != nil || knownCode) {
+			f.attempt = ResetAttempt{} // the only request was refused: nothing spent
+		} else {
+			f.holdUnresolved() // unknown response, or an earlier attempt may have landed
+		}
 		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
 		return time.Time{}
 	case decisionRetry:
 		f.attempt.Attempt++
 		if f.attempt.Attempt > len(resetRetryDelays) {
 			f.state = StateDONE
+			f.holdUnresolved() // a timed-out consume may still have landed
 			f.log("error",
 				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
 				"abandon", nil,
@@ -382,82 +708,140 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 }
 
 func (f *AccountFSM) stepVERIFYING() time.Time {
-	credits, err := f.Client.ListCredits(f.Creds)
+	// Consumption receipt (user's rule): the pinned target's confirmed
+	// absence in a FRESH successful post-consume credit-list query is the
+	// only acceptable proof. Search the raw returned records by ID — not the
+	// locally availability-filtered list — so a still-present record with a
+	// changed status or expiry still counts as present. A failed query is
+	// unknown, never an empty list. Absence explainable by expiry alone
+	// (target expiry already passed at verification time) is not claimed as
+	// consumption.
+	credits, err := f.Client.ListAllCredits(f.Creds)
 	if err != nil {
 		f.state = StateDONE
-		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
+		f.holdUnresolved()
+		f.log("error", fmt.Sprintf("verification failed (post-reset list): %v", err), "abandon", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
 		return time.Time{}
 	}
-	usage, err := f.Client.GetUsage(f.Creds)
-	if err != nil {
-		f.state = StateDONE
-		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
+	reclassify := f.attempt.Classified // an earlier verification already recorded history
+	f.attempt.Classified = true
+	f.attempt.Reverify = false // the target is now classified from a fresh list
+	// A failed usage query leaves recovery unknown but must not erase the
+	// target-consumption evidence the fresh list already established.
+	usage, usageErr := f.Client.GetUsage(f.Creds)
+	if usageErr != nil {
+		usage = Snapshot{WeeklyPct: -1}
+		f.log("error", fmt.Sprintf("verification: post-reset usage failed, recovery unknown: %v", usageErr), "verify consumption only", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
-		return time.Time{}
 	}
 	// Update lastSnapshot with post-reset data so the UI shows the new state.
 	credits.WeeklyPct = usage.WeeklyPct
 	f.lastSnapshot = credits
 
-	// Triple deduction check (spec §4.3 invariant 3).
-	targetGone := true
-	for _, c := range credits.Credits {
-		if c.ID == f.attempt.TargetCreditID && c.Status == "available" {
-			targetGone = false
+	now := f.now()
+	// Classify the pinned target ID across the raw rows:
+	//   status=="available" (any expiry, changed or not) → PRESENT, not consumed
+	//   status redeemed/consumed/used or redeemed_at set → CONSUMED
+	//   absent entirely                                  → CONSUMED, unless the
+	//     pinned expected expiry already passed (expiry explains) → INCONCLUSIVE
+	//   any other status (expired/redeeming/unknown)     → INCONCLUSIVE
+	var targetRow *Credit
+	for i := range credits.Credits {
+		if credits.Credits[i].ID == f.attempt.TargetCreditID {
+			targetRow = &credits.Credits[i]
 			break
 		}
 	}
+	expiryExplains := !f.attempt.TargetExpiresAt.IsZero() && !f.attempt.TargetExpiresAt.After(now)
+	consumption := "inconclusive"
+	switch {
+	case targetRow == nil && !expiryExplains:
+		consumption = "consumed"
+	case targetRow == nil && expiryExplains:
+		consumption = "inconclusive"
+	case targetRow.Status == "available":
+		consumption = "present"
+	case targetRow.Consumed():
+		consumption = "consumed"
+	}
+	if f.attempt.ConsumptionConfirmed {
+		consumption = "consumed" // consumption evidence is monotonic
+	}
+	targetConsumed := consumption == "consumed"
+	if targetConsumed {
+		f.attempt.ConsumptionConfirmed = true
+	}
 	countDown1 := credits.AvailableCount == f.attempt.PreSnapshot.AvailableCount-1
-	quotaUp := usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct
+	quotaUp := usageErr == nil && usage.WeeklyKnown && (usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
 
 	f.state = StateDONE
-	// Build detailed details map with full before/after snapshot.
 	details := map[string]any{
-		"credit_id":            f.attempt.TargetCreditID,
-		"redeem_request_id":    f.attempt.RedeemRequestID,
-		"pre_credits":          f.attempt.PreSnapshot.AvailableCount,
-		"post_credits":         credits.AvailableCount,
-		"pre_weekly_pct":       f.attempt.PreSnapshot.WeeklyPct,
-		"post_weekly_pct":      usage.WeeklyPct,
-		"target_gone":          targetGone,
-		"count_down_1":         countDown1,
-		"quota_recovered":      quotaUp,
+		"credit_id":             f.attempt.TargetCreditID,
+		"redeem_request_id":     f.attempt.RedeemRequestID,
+		"cycle_reason":          string(f.attempt.CycleReason),
+		"pre_credits":           f.attempt.PreSnapshot.AvailableCount,
+		"post_credits":          credits.AvailableCount,
+		"pre_weekly_pct":        f.attempt.PreSnapshot.WeeklyPct,
+		"post_weekly_pct":       usage.WeeklyPct,
+		"target_status":         consumption,
+		"expiry_explains":       expiryExplains,
+		"consumption_confirmed": targetConsumed,
+		"count_down_1":          countDown1,
+		"quota_recovered":       quotaUp,
 	}
 
-	success := targetGone && countDown1 && quotaUp
+	success := targetConsumed && countDown1 && quotaUp
 
 	switch {
 	case success:
+		f.autoHold, f.holdRecoveryOnly = false, false // resolved
 		f.log("info",
 			fmt.Sprintf("reset verified OK: credits %d→%d, weekly %d%%→%d%%, target %s consumed",
 				f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
 				f.attempt.PreSnapshot.WeeklyPct, usage.WeeklyPct,
 				shortID(f.attempt.TargetCreditID)),
 			"cycle complete", nil, details)
-	case targetGone && countDown1:
+	case targetConsumed:
+		// Only "consumed and count verified" leaves recovery as the sole open
+		// question that a later patrol may resolve read-only.
+		f.setHold(countDown1) // consumed, recovery pending: never compensate
 		f.log("warn",
-			fmt.Sprintf("reset PARTIAL: credits %d→%d ok but weekly %d%%→%d%% (delayed recovery?)",
-				f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
+			fmt.Sprintf("reset PARTIAL: target %s consumed (count_down_1=%v) but weekly %d%%→%d%% not confirmed recovered; holding, no compensation",
+				shortID(f.attempt.TargetCreditID), countDown1,
 				f.attempt.PreSnapshot.WeeklyPct, usage.WeeklyPct),
 			"cycle complete", nil, details)
 	default:
+		f.setHold(false) // durable automatic-spending hold until a later verification resolves
+		if consumption == "inconclusive" && targetRow != nil && targetRow.InFlight() {
+			// Redemption still in progress: re-verify this target. Any other
+			// unrecognized status is left to the stable-check release.
+			f.attempt.Reverify = true
+		}
 		f.log("error",
-			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
-				targetGone, countDown1, quotaUp),
+			fmt.Sprintf("reset MISMATCH: target_status=%s expiry_explains=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
+				consumption, expiryExplains, countDown1, quotaUp),
 			"abandon", nil, details)
 	}
 
-	// Capture the reset result for history. NOT cleared by Reset().
+	// Capture the reset result for history. ConsumptionConfirmed is recorded
+	// separately from Success so "consumed but recovery pending" survives a
+	// restart and cannot invite an automatic compensating consume.
+	if reclassify && consumption == "inconclusive" {
+		return time.Time{} // still unresolved: no duplicate history record
+	}
 	f.pendingHistory = &ResetRecord{
-		Timestamp:     f.now(),
-		AuthID:        f.AuthID,
-		CreditID:      f.attempt.TargetCreditID,
-		Success:       success,
-		PreWeeklyPct:  f.attempt.PreSnapshot.WeeklyPct,
-		PostWeeklyPct: usage.WeeklyPct,
-		PreCredits:    f.attempt.PreSnapshot.AvailableCount,
-		PostCredits:   credits.AvailableCount,
+		Timestamp:            now,
+		AuthID:               f.AuthID,
+		CreditID:             f.attempt.TargetCreditID,
+		Success:              success,
+		RecoveryConfirmed:    quotaUp,
+		ConsumptionConfirmed: targetConsumed,
+		CycleReason:          f.attempt.CycleReason,
+		PreWeeklyPct:         f.attempt.PreSnapshot.WeeklyPct,
+		PostWeeklyPct:        usage.WeeklyPct,
+		PreCredits:           f.attempt.PreSnapshot.AvailableCount,
+		PostCredits:          credits.AvailableCount,
 	}
 
 	return time.Time{}
@@ -475,11 +859,17 @@ func (f *AccountFSM) Reset() {
 // resetLocked is Reset's body for callers already holding mu (StepAndSettle).
 func (f *AccountFSM) resetLocked() {
 	f.state = StateIDLE
-	f.attempt = ResetAttempt{}
+	// A held account keeps its attempt (target, key, pre-snapshot) so the
+	// outcome can still be reconciled read-only, also after a restart.
+	if !f.autoHold {
+		f.attempt = ResetAttempt{}
+	}
 	f.verifyDue = time.Time{}
 	f.nextWake = time.Time{}
 	f.scheduledCreditID = ""
+	f.scheduledExpiry = time.Time{}
 	f.manualReset = false
+	f.weeklyWake = false
 }
 
 // TakePendingHistory returns the reset result captured in stepVERIFYING and

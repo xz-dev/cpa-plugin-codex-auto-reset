@@ -210,3 +210,71 @@ func TestParseConsumeResponse_DefaultsWindowsReset(t *testing.T) {
 		t.Fatalf("windows_reset = %d, want 0", resp.WindowsReset)
 	}
 }
+
+// TestParseUsage_WeeklyEvidence verifies the unrounded, known/unknown normal
+// weekly evidence that authorizes (or refuses) exhaustion-based redemption.
+func TestParseUsage_WeeklyEvidence(t *testing.T) {
+	now := time.Now()
+	// 100% normal weekly in secondary window → exhausted, known.
+	raw := []byte(`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":100},"secondary_window":{"limit_window_seconds":604800,"used_percent":100}}}`)
+	snap, err := parseUsageResponse(raw, now)
+	if err != nil || !snap.WeeklyKnown || snap.WeeklyUsedPct != 100 || !snap.WeeklyExhausted() {
+		t.Fatalf("100%% weekly: %+v err=%v", snap, err)
+	}
+	// 99.6% rounds display to 0 remaining but MUST NOT authorize.
+	raw = []byte(`{"rate_limit":{"secondary_window":{"limit_window_seconds":604800,"used_percent":99.6}}}`)
+	snap, _ = parseUsageResponse(raw, now)
+	if snap.WeeklyExhausted() {
+		t.Fatalf("99.6%% must not count as exhausted: %+v", snap)
+	}
+	if snap.WeeklyPct != 0 {
+		t.Fatalf("99.6%% should display as 0 remaining, got %d", snap.WeeklyPct)
+	}
+	// Missing weekly window → unknown, never exhausted.
+	raw = []byte(`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":100}}}`)
+	snap, _ = parseUsageResponse(raw, now)
+	if snap.WeeklyKnown || snap.WeeklyExhausted() {
+		t.Fatalf("five-hour exhaustion without weekly window must be unknown: %+v", snap)
+	}
+	// Code-review-only weekly exhaustion → display may show it, evidence unknown.
+	raw = []byte(`{"code_review_rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":100}},"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":100}}}`)
+	snap, _ = parseUsageResponse(raw, now)
+	if snap.WeeklyKnown || snap.WeeklyExhausted() {
+		t.Fatalf("code-review-only weekly must not authorize: %+v", snap)
+	}
+	// Malformed body → parse error, treated as unknown upstream.
+	if _, err := parseUsageResponse([]byte(`{bad`), now); err == nil {
+		t.Fatal("malformed usage must error")
+	}
+}
+
+// TestParse_RealUpstreamShape2026_10_28 uses the field layout of a real
+// read-only response captured on 2026-10-28 (ids, emails and urls replaced).
+func TestParse_RealUpstreamShape2026_10_28(t *testing.T) {
+	now := time.Date(2026, 10, 28, 6, 0, 0, 0, time.UTC)
+	credits := `{"credits":[
+	 {"id":"RateLimitResetCredit_aaa","reset_type":"codex_rate_limits","is_supported_by_plan":true,"status":"available",
+	  "granted_at":"2026-09-29T19:04:56.951893Z","expires_at":"2026-10-29T19:04:56.951893Z","redeem_started_at":null,"redeemed_at":null,
+	  "profile_image_url":"x","profile_user_id":"x","title":"x","description":"x"},
+	 {"id":"RateLimitResetCredit_bbb","reset_type":"codex_rate_limits","is_supported_by_plan":true,"status":"available",
+	  "granted_at":"2026-10-07T23:34:39.272695Z","expires_at":"2026-11-06T23:34:39.272695Z","redeem_started_at":null,"redeemed_at":null,
+	  "profile_image_url":"x","profile_user_id":"x","title":"x","description":"x"}],
+	 "available_count":2,"total_earned_count":0,"immediate_reset_purchase_eligible":false,"history_enabled":true}`
+	snap, err := parseResetCreditsResponse([]byte(credits), now)
+	if err != nil || snap.AvailableCount != 2 || len(snap.Credits) != 2 || snap.Credits[0].ID != "RateLimitResetCredit_aaa" {
+		t.Fatalf("credits: %+v err=%v", snap, err)
+	}
+	if snap.Credits[0].Redeemed {
+		t.Fatal("null redeemed_at must not mark a credit redeemed")
+	}
+	usage := `{"user_id":"x","account_id":"x","email":"x","plan_type":"pro",
+	 "rate_limit":{"allowed":true,"limit_reached":false,
+	  "primary_window":{"used_percent":28,"limit_window_seconds":604800,"reset_after_seconds":434898,"reset_at":1793599671},
+	  "secondary_window":null},
+	 "code_review_rate_limit":null,"additional_rate_limits":null,
+	 "rate_limit_reset_credits":{"available_count":2,"applicable_available_count":2}}`
+	u, err := parseUsageResponse([]byte(usage), now)
+	if err != nil || !u.WeeklyKnown || u.WeeklyUsedPct != 28 || u.WeeklyPct != 72 || u.WeeklyExhausted() {
+		t.Fatalf("usage: %+v err=%v", u, err)
+	}
+}
