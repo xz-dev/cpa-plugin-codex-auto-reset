@@ -621,7 +621,7 @@ func pluginRegistration() registration {
 			Name:             "Codex Auto Reset",
 			Version:          pluginVersion,
 			Author:           "Jeffery",
-			GitHubRepository: "https://github.com/JefferyZhang2019/cpa-plugin-codex-auto-reset",
+			GitHubRepository: "https://github.com/xz-dev/cpa-plugin-codex-auto-reset",
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true},
 	}

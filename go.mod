@@ -1,4 +1,4 @@
-module github.com/jeffery/cpa-plugin-codex-auto-reset
+module github.com/xz-dev/cpa-plugin-codex-auto-reset
 
 go 1.26.0
 
