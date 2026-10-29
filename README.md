@@ -1,5 +1,7 @@
 # Codex Auto Reset
 
+English | [简体中文](README.zh.md)
+
 `codex-auto-reset` is a [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) plugin that redeems Codex "Reset Bank" credits on your behalf.
 
 Codex/ChatGPT accounts collect rate-limit reset credits. Each credit resets an account's weekly rate-limit window once, and each credit expires. Credits that nobody redeems in time are lost, and credits redeemed at the wrong moment are wasted. The plugin watches the accounts you enable and spends a credit only when a rule allows it:
@@ -9,16 +11,16 @@ Codex/ChatGPT accounts collect rate-limit reset credits. Each credit resets an a
 
 Every redemption names one exact credit and is verified afterwards. When the plugin cannot prove what happened, it stops automatic spending for that account instead of guessing.
 
-The plugin runs inside CPA as a dynamic library. It reads Codex credentials through the host ABI, talks to the ChatGPT backend directly, and after a verified reset asks CPA to clear that credential's routing cooldown so traffic resumes at once.
+The plugin runs inside CPA as a dynamic library. It reads Codex credentials through CPA's plugin interface, talks to the ChatGPT backend directly, and after a verified reset asks CPA to clear that credential's routing cooldown so traffic resumes at once.
 
 ## What it does
 
-- **Per-account policy.** Global defaults plus an enabled/disabled account list; no account is enabled by default. Each account can override every setting: patrol interval, lead time, weekly-exhaustion redemption, and natural-recovery deferral with its window. Overrides show the inherited global value, and **Restore defaults** removes them.
-- **Expiry redemption.** Each patrol (default every 1h) finds the soonest-expiring credit, pins its ID and expiry, and sleeps until expiry minus the lead time (default 5m). It then redeems exactly that credit. It never substitutes another credit and never sends a request after the target has expired.
-- **Weekly-exhaustion redemption (opt-in).** Redeems a credit once a fresh, unrounded reading shows the normal weekly window at `used_percent >= 100`. Ordinary 429s, the 5-hour window, code-review limits and unknown usage never trigger it.
+- **Per-account policy.** Global defaults plus an enabled/disabled account list; no account is enabled by default. Each account can override any of the global defaults: patrol interval, lead time, weekly-exhaustion redemption, and natural-recovery deferral with its window. Overrides show the inherited global value, and **Restore defaults** removes them.
+- **Expiry redemption.** Each patrol (default every 1h) finds the soonest-expiring credit, pins its ID and expiry, and waits until expiry minus the lead time (default 5m). It then redeems exactly that credit. It never substitutes another credit and never sends a request after the target has expired.
+- **Weekly-exhaustion redemption (opt-in).** Redeems a credit once a fresh, unrounded reading shows the normal weekly window at `used_percent >= 100`. Ordinary 429s, the separate 5-hour window, code-review limits and unknown usage never trigger it.
 - **Natural-recovery deferral (opt-in).** Skips a weekly-exhaustion redemption when the same weekly window will recover on its own within a set window (default 24h, boundary inclusive), so a credit is not spent on quota that is about to return anyway. An expiry trigger still wins. If upstream gives no trustworthy recovery time, the plain exhaustion rule applies.
-- **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is listed as `redeemed`/`consumed`/`used` or with a `redeemed_at` time. Success also requires the available count to drop by one and the weekly quota to recover. Transient errors retry with the same idempotency key.
-- **Automatic-spending hold.** Any unclear outcome stops automatic redemption for that account. Patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a "consumed, recovery pending" attempt's quota recovers.
+- **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is listed as `redeemed`/`consumed`/`used` or with a `redeemed_at` time. Success also requires the available count to drop by one and the weekly quota to recover. Transient errors are retried with the same idempotency key, so a retry cannot redeem twice.
+- **Automatic-spending hold.** Any unclear outcome stops automatic redemption for that account. Patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a redemption that already used its credit sees the account's quota come back.
 - **Manual control.** **Check now** runs an immediate read-only patrol. **Redeem now** redeems the soonest-expiring credit after confirmation; it bypasses deferral and is the manual way out of a hold.
 - **History and logs.** Every redemption is recorded in a reset-statistics panel. Recent log entries (up to 1000, kept 7 days) appear on the page.
 - **Durable state.** Settings, per-account state, history and logs survive CPA restarts and container recreates. The state file holds no tokens, keeps a backup copy, and quarantines a corrupt file instead of overwriting it.
@@ -51,7 +53,7 @@ Keep only one version of the plugin in the plugin directory. To upgrade, replace
 
 ## Usage
 
-Open the page from CPA's plugin resources, or go to `/v0/resource/plugins/codex-auto-reset/status`. It also works behind a path prefix such as `/cpa/v0/resource/...`.
+Open the page from CPA's plugin resources, or go to `/v0/resource/plugins/codex-auto-reset/status`. The page also works behind a path prefix such as `/cpa/v0/resource/...`.
 
 First sign in to the Management Center with "remember password" checked. The page reuses that saved sign-in for the same CPA instance and shows guidance if it is missing or rejected. Then:
 
@@ -79,7 +81,7 @@ account_overrides:                       # any setting above, per account
 state_dir: /absolute/path                # optional state location override
 ```
 
-By default state lives in `<CPA auth dir>/plugin-state/codex-auto-reset/state.data`. With Docker, mounting the auth dir (already required for credentials) is enough to keep it.
+By default, state lives in `<CPA auth dir>/plugin-state/codex-auto-reset/state.data`. With Docker, mounting the auth dir (already required for credentials) is enough to keep it.
 
 The management API (all routes require the CPA Management key) is listed in [docs/reference.md](docs/reference.md#management-api).
 
@@ -112,7 +114,7 @@ Repository layout:
 
 ## Background
 
-CPA routes requests across many Codex accounts, and each account's reset credits expire on their own schedule. Redeeming them by hand is easy to forget. Redeeming the wrong credit, redeeming twice, or redeeming a day before the quota would have come back anyway wastes credits. The plugin therefore spends only when a rule allows it, always names the exact credit, verifies the result, and stops automatic spending whenever it cannot prove what happened.
+CPA routes requests across many Codex accounts, and each account's reset credits expire on their own schedule. Redeeming them by hand is easy to forget. Redeeming the wrong credit, redeeming twice, or redeeming shortly before the quota would have come back anyway wastes credits. The plugin therefore spends only when a rule allows it, always names the exact credit, verifies the result, and stops automatic spending whenever it cannot prove what happened.
 
 ## License
 
