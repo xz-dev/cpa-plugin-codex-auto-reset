@@ -18,7 +18,10 @@ CONFIRMING → re-list credits; validate the pinned target is still available
              reading under an effective opt-in authorizes the cycle reason
              "weekly_exhaustion" — otherwise re-arm for expiry. Fetch usage,
              pin the target's expected expiry, mint a redeem_request_id,
-             enter RESETTING
+             enter RESETTING. With defer_reset_near_weekly_recovery enabled
+             a fresh weekly recovery inside weekly_recovery_guard_window
+             defers instead of consuming — a credit still due within its
+             arming window stays pinned and armed for its expiry trigger.
 RESETTING  → POST /consume with {redeem_request_id, credit_id}; never after
              the pinned target's expiry; on success enter VERIFYING; on
              transient error retry (same idempotency key, 1/2/5/10/30 min
@@ -29,6 +32,8 @@ VERIFYING  → after 1 min, a FRESH unfiltered credit list must prove the
              plus count −1 and weekly recovered; enter DONE
 DONE       → cycle complete; back to IDLE
 ```
+
+Natural-recovery deferral (opt-in, default off): when `defer_reset_near_weekly_recovery` is on for an account, a CONFIRMING step that would newly authorize a weekly-exhaustion cycle first checks the same normal weekly window's recovery time (`reset_at`, or `reset_after_seconds` anchored at the usage capture). If that recovery lies in the future and within the effective `weekly_recovery_guard_window` (default 24 hours, inclusive boundary), nothing is consumed — no attempt, history, or hold — and the credit keeps its ordinary expiry schedule: inside the arming window it is pinned and armed for its trigger time, otherwise the next patrol re-evaluates. Missing, past, or untrustworthy recovery time falls back to the ordinary exhaustion rule rather than deferring; expiry triggers already reached win outright. Manual **Redeem now** bypasses the guard.
 
 An automatic cycle never substitutes another credit if its pinned target is redeemed, removed, or expired, even if another credit is already due. A missing target ID also abandons the cycle. Expiry mode never redeems credits with no expiry; if the pinned target becomes non-expiring, that expiry cycle is abandoned. An account opted in to weekly-exhaustion mode may redeem a non-expiring credit (sorted last) after freshly confirmed weekly exhaustion. The next IDLE patrol can schedule a new cycle normally.
 

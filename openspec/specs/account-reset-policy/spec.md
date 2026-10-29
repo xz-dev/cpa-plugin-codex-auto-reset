@@ -7,21 +7,26 @@ Define inherited account reset policy, durable configuration compatibility, and 
 
 ### Requirement: Establish global reset defaults
 
-For a new installation or a missing setting, the plugin SHALL default to a 1-hour patrol interval, a 5-minute credit-expiry lead time, weekly-exhaustion redemption disabled, and no accounts enabled. The weekly-exhaustion option SHALL be a default that accounts can override, not an additional master enablement gate.
+For a new installation or a missing setting, the plugin SHALL default to a 1-hour patrol interval, a 5-minute credit-expiry lead time, weekly-exhaustion redemption disabled, natural-recovery deferral disabled, a 24-hour natural-recovery guard window, and no accounts enabled. One day SHALL mean 24 elapsed hours, not a calendar-day boundary. Both boolean options SHALL be defaults that accounts can override independently, not additional master enablement gates.
 
 #### Scenario: Start without saved policy
 - **WHEN** the plugin starts without saved policy or explicit timing settings
-- **THEN** its global timing is 1 hour and 5 minutes
-- **AND** weekly-exhaustion redemption is disabled and no account is automatically enabled
+- **THEN** its global timing is 1 hour and 5 minutes, and its natural-recovery guard window is 24 hours
+- **AND** weekly-exhaustion redemption and natural-recovery deferral are disabled and no account is automatically enabled
 
 #### Scenario: Explicit account opt-in under a disabled global default
 - **WHEN** an enabled account explicitly enables weekly-exhaustion redemption while the global default is disabled
 - **THEN** that account can use the weekly-exhaustion policy
 - **AND** accounts still inheriting the disabled global default cannot
 
+#### Scenario: Explicit account guard opt-in
+- **WHEN** an account explicitly enables natural-recovery deferral while the global guard default is disabled
+- **THEN** that account uses its effective guard window whenever it is otherwise eligible for weekly-exhaustion redemption
+- **AND** this guard opt-in does not enable weekly-exhaustion redemption by itself
+
 ### Requirement: Resolve sparse account overrides
 
-The plugin SHALL resolve each account policy field independently from a saved override or the global default. Missing account fields SHALL mean inheritance; an explicit false boolean SHALL remain a real override. Clearing an account override SHALL restore inheritance rather than copying the current global value. Policy SHALL be associated with stable account identity, not a display label.
+The plugin SHALL resolve each account policy field independently from a saved override or the global default, including the natural-recovery deferral switch and guard window. Missing account fields SHALL mean inheritance; an explicit false boolean SHALL remain a real override. Clearing an account override SHALL restore inheritance rather than copying the current global value. Policy SHALL be associated with stable account identity, not a display label or model name.
 
 #### Scenario: Explicit false survives a global opt-in
 - **WHEN** global weekly-exhaustion redemption is enabled and an account explicitly disables it
@@ -32,27 +37,47 @@ The plugin SHALL resolve each account policy field independently from a saved ov
 - **THEN** its next eligible schedule uses the current global lead time
 - **AND** its other overrides, enablement, and history remain unchanged
 
+#### Scenario: Override guard duration without overriding its switch
+- **WHEN** the global guard is enabled with a 24-hour window and an account overrides only the window to 6 hours
+- **THEN** that account inherits the enabled guard switch and uses a 6-hour window
+- **AND** a later global switch change affects the account while a global window change does not replace its 6-hour override
+
+#### Scenario: Explicitly disable the guard for one account
+- **WHEN** the global guard is enabled and an account explicitly disables it while leaving its window inherited
+- **THEN** that account does not defer weekly-exhaustion redemption because of natural recovery
+- **AND** its explicit false survives save and reload
+
 ### Requirement: Preserve existing configuration and durable state
 
-Existing valid global durations, enabled accounts, state location, history, and in-progress redemption information SHALL survive upgrade, restart, export, and import. Old states without new policy fields SHALL load with no account overrides and weekly-exhaustion redemption disabled. Previously persisted durations SHALL NOT be overwritten merely because they equal former defaults. Supported legacy duration representations SHALL remain readable. New settings requests omitting new fields SHALL NOT erase existing values for those fields.
+Existing valid global durations, enabled accounts, state location, history, account overrides, and in-progress redemption information SHALL survive upgrade, restart, export, and import. States predating weekly-exhaustion policy SHALL load with no account overrides and weekly-exhaustion redemption disabled. States missing only the natural-recovery fields SHALL load with the guard disabled and a 24-hour guard window, without resetting existing weekly-exhaustion choices or account overrides. Previously persisted durations SHALL NOT be overwritten merely because they equal former defaults. Supported legacy duration representations SHALL remain readable. Settings requests omitting the new global fields SHALL preserve their saved values; an omitted account-override map SHALL also remain unchanged. An explicitly supplied account-override map SHALL retain its existing whole-map replacement semantics, with absent fields in its entries meaning inheritance.
 
 #### Scenario: Upgrade an existing installation
-- **WHEN** a saved state contains 12-hour patrol and 6-hour lead time but no new policy fields
+- **WHEN** a saved state contains 12-hour patrol and 6-hour lead time but no weekly-exhaustion or account-override fields
 - **THEN** those saved durations and enabled accounts are retained
-- **AND** the new automatic-exhaustion option starts disabled without account overrides
+- **AND** weekly-exhaustion redemption and natural-recovery deferral start disabled, the guard window is 24 hours, and no account overrides are invented
+
+#### Scenario: Upgrade an installation already using weekly exhaustion
+- **WHEN** saved policy enables weekly-exhaustion redemption and contains account overrides but no natural-recovery fields
+- **THEN** those existing settings are retained
+- **AND** the new guard is disabled with a 24-hour default window, so existing redemption behavior is unchanged
 
 #### Scenario: Legacy settings client saves configuration
-- **WHEN** a valid settings request updates the legacy fields and omits account overrides and the new boolean
+- **WHEN** a valid settings request updates legacy fields and omits the new global fields and account overrides
 - **THEN** the requested legacy changes are applied without discarding the omitted policy fields
 
 #### Scenario: Policy survives export and restart
-- **WHEN** policy with inherited fields and an explicit false account override is exported/imported or reloaded after restart
-- **THEN** the distinction between inheritance and explicit false is preserved
+- **WHEN** policy with inherited fields, an explicit false guard override, and a custom guard window is exported/imported or reloaded after restart
+- **THEN** the distinction between inheritance and explicit false and the custom duration are preserved
 - **AND** no credential material is added to plugin state or exports
+
+#### Scenario: Explicit replacement restores inheritance
+- **WHEN** an operator supplies a replacement account-override map whose account entry omits its former guard-window override
+- **THEN** that account's window returns to inheritance
+- **AND** the omitted field is not silently retained as an override
 
 ### Requirement: Preserve expiry-based redemption scheduling
 
-Enabled accounts SHALL retain automatic redemption of a pinned, available credit at its expiry minus the effective lead time. Patrol cadence SHALL NOT quantize that trigger to the next full patrol interval. A normal check SHALL NOT authorize early expiry-based redemption. An unavailable pinned target SHALL NOT be silently replaced within the same cycle.
+Enabled accounts SHALL retain automatic redemption of a pinned, available credit at its expiry minus the effective lead time. Within otherwise eligible automatic redemption, a reached expiry trigger SHALL take precedence over natural-recovery deferral, regardless of whether weekly quota is exhausted. This precedence SHALL NOT bypass account enablement, automatic-spending holds, target validity, or existing confirmation safeguards. Patrol cadence SHALL NOT quantize the expiry trigger to the next full patrol interval. Deferring weekly-exhaustion redemption SHALL retain or recompute the selected credit's ordinary expiry schedule without replacing an already pinned target. A normal check SHALL NOT authorize early expiry-based redemption. An unavailable pinned target SHALL NOT be silently replaced within the same cycle.
 
 #### Scenario: One-hour patrol with five-minute lead time
 - **WHEN** a patrol discovers a credit whose trigger time falls before the next patrol
@@ -63,12 +88,22 @@ Enabled accounts SHALL retain automatic redemption of a pinned, available credit
 - **WHEN** an account without applicable weekly-exhaustion authorization is checked before its expiry trigger
 - **THEN** the plugin does not redeem early and retains or recomputes the pinned target's valid schedule
 
+#### Scenario: Expiry trigger overrides natural-recovery deferral
+- **WHEN** an otherwise eligible credit reaches its expiry trigger while natural recovery is 12 hours away and the account's 24-hour guard is enabled
+- **THEN** the plugin proceeds under expiry-based authorization and records the expiry reason
+- **AND** it does not wait for natural recovery
+
+#### Scenario: Deferred exhaustion must not hide an earlier expiry trigger
+- **WHEN** a fresh check defers weekly-exhaustion redemption, natural recovery is 12 hours away, the selected credit's expiry trigger is 20 minutes away, and the patrol interval is 1 hour
+- **THEN** no consume is sent for exhaustion at that check
+- **AND** the plugin schedules the credit's expiry trigger in 20 minutes rather than waiting 1 hour or 12 hours
+
 ### Requirement: Redeem for weekly exhaustion only after fresh confirmation
 
-Automatic exhaustion-based redemption SHALL require plugin enablement, the effective weekly-exhaustion option enabled, a fresh successful upstream query proving the normal Codex weekly window is exhausted, and a valid available reset credit. The decision MUST use unrounded weekly utilization, not the displayed integer remaining percentage. Unknown/malformed usage, a missing weekly window, short-window exhaustion, dedicated code-review limits, ordinary rate limits, or an error status alone SHALL NOT authorize this redemption.
+Automatic exhaustion-based redemption SHALL require plugin enablement, the effective weekly-exhaustion option enabled, a fresh successful upstream query proving the normal Codex weekly window is exhausted, a valid available reset credit, and no applicable natural-recovery deferral. The decision MUST use unrounded weekly utilization, not the displayed integer remaining percentage. Unknown/malformed usage, a missing weekly window, short-window exhaustion, dedicated code-review limits, ordinary rate limits, or an error status alone SHALL NOT authorize this redemption. Missing recovery-time information SHALL NOT weaken these exhaustion-proof requirements.
 
 #### Scenario: Confirmed weekly exhaustion
-- **WHEN** an opted-in enabled account is freshly confirmed to have used at least 100 percent of its normal weekly quota and has an available reset credit
+- **WHEN** an opted-in enabled account is freshly confirmed to have used at least 100 percent of its normal weekly quota, has an available reset credit, and the natural-recovery guard does not defer the decision
 - **THEN** the plugin can begin one targeted exhaustion-based redemption before the credit's expiry-trigger window
 
 #### Scenario: Display rounding is not exhaustion
@@ -156,3 +191,52 @@ Full reset verification SHALL retain all three checks: confirmed target-specific
 - **WHEN** verification is inconclusive and the plugin restarts or receives another failure hint
 - **THEN** the unresolved attempt and any confirmed consumption evidence remain visible and cannot silently turn into a new automatic redemption
 - **AND** read-only outcome reconciliation remains possible
+
+### Requirement: Defer weekly-exhaustion redemption near natural recovery
+
+For an otherwise authorized new weekly-exhaustion redemption, the plugin SHALL defer without consuming a credit when the effective natural-recovery guard is enabled and the freshly confirmed normal weekly window has a trustworthy future recovery time whose remaining duration is less than or equal to the effective guard window. Recovery time SHALL come from the same normal weekly window as the exhaustion evidence, not a short window, code-review limit, another account, or a cached observation. If no trustworthy future recovery time is available, the plugin SHALL apply existing weekly-exhaustion redemption rules without this deferral. The same rule SHALL apply to periodic checks, failure-notification rechecks, and Check now. The guard SHALL NOT independently enable redemption, block explicit manual redemption, weaken automatic-spending holds, or cancel or replace an existing consume/verification attempt. Deferred decisions SHALL be re-evaluated using fresh usage on subsequent eligible checks, not treated as a durable authorization or an unresolved-consumption hold.
+
+#### Scenario: Recovery lies inside the guard window
+- **WHEN** an otherwise eligible account has its guard enabled for 24 hours, a fresh check proves weekly exhaustion and recovery in 12 hours, and its credit is not yet due for expiry redemption
+- **THEN** the plugin defers exhaustion-based redemption without sending consume or recording a consumed credit
+- **AND** periodic checking and the credit-expiry schedule remain active
+
+#### Scenario: Recovery is exactly at the inclusive boundary
+- **WHEN** the same conditions hold with recovery exactly 24 hours away
+- **THEN** the plugin defers exhaustion-based redemption
+
+#### Scenario: Recovery lies outside the guard window
+- **WHEN** an otherwise eligible account has its guard enabled for 24 hours and fresh weekly evidence shows recovery in 30 hours
+- **THEN** the guard does not block exhaustion-based redemption
+
+#### Scenario: Disabled guard preserves existing behavior
+- **WHEN** an otherwise eligible account has the guard disabled and fresh weekly evidence shows recovery in 6 hours
+- **THEN** natural recovery does not defer exhaustion-based redemption
+
+#### Scenario: Recovery time is unavailable or untrustworthy
+- **WHEN** fresh usage proves normal weekly exhaustion but its recovery time is missing, malformed, or not a trustworthy future time
+- **THEN** the guard does not block otherwise authorized exhaustion-based redemption
+- **AND** the plugin distinguishes unavailable recovery time from unknown weekly usage
+
+#### Scenario: Another quota window recovers soon
+- **WHEN** fresh normal weekly exhaustion is confirmed with recovery in 30 hours, but a five-hour or code-review window recovers in 1 hour
+- **THEN** a 24-hour guard does not defer redemption based on the unrelated recovery time
+
+#### Scenario: A newer check changes the recovery evidence
+- **WHEN** a previous check showed recovery outside the guard window but the final fresh confirmation shows recovery inside it
+- **THEN** the new exhaustion-based redemption is deferred using the final fresh evidence
+- **AND** an older cached recovery time does not authorize consumption
+
+#### Scenario: Guard does not grant another redemption authority
+- **WHEN** the guard is enabled but weekly-exhaustion redemption is disabled or the account has an unresolved automatic-spending hold
+- **THEN** the guard does not authorize a new exhaustion-based redemption
+
+#### Scenario: Guard changes during an active redemption
+- **WHEN** an operator enables or changes the guard while consume, retry, or verification is already in progress
+- **THEN** the existing attempt retains its target, idempotency key, and outcome tracking under the existing retry and expiry safeguards
+- **AND** the new guard configuration applies to later new automatic decisions rather than creating or cancelling a consume attempt
+
+#### Scenario: Manual redemption remains explicit
+- **WHEN** an operator explicitly requests Redeem now while natural recovery lies inside the guard window
+- **THEN** the guard does not block that manual authorization
+- **AND** the existing target validation, active-attempt serialization, and consumption verification still apply

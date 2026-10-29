@@ -11,6 +11,7 @@ The plugin is independent of CPA's routing. It reads Codex credentials through t
 - **Account list.** Global defaults plus an enabled/disabled account list. Drag accounts (or use the buttons) to enable them. Each account can override the patrol interval, the lead time and the weekly-exhaustion option; overrides show the inherited global value as a hint, and Restore defaults removes them. No account is enabled by default.
 - **Expiry redemption.** Every patrol (default 1h) the plugin finds the soonest-expiring credit, pins its ID and expiry, and redeems exactly that credit at expiry minus the lead time (default 5m). It never substitutes another credit and never sends a request after the target has expired.
 - **Weekly-exhaustion redemption (opt-in, default off).** When enabled, a credit is redeemed only after a fresh, unrounded normal-weekly `used_percent >= 100`. Ordinary 429s, the 5-hour window, code-review limits and unknown usage never trigger it.
+- **Natural-recovery deferral (opt-in, default off).** When enabled, an otherwise-authorized weekly-exhaustion redemption is skipped if the same normal weekly window will recover on its own within a configurable window (default 24 hours, inclusive). A credit's expiry-minus-lead-time trigger still redeems first. If upstream reports no trustworthy recovery time, the exhaustion rule applies unchanged.
 - **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is still listed with status `redeemed`/`consumed`/`used` or a `redeemed_at` time. Success also needs the available count to drop by one and the weekly quota to recover.
 - **Automatic-spending hold.** If the outcome is unclear, automatic redemption for that account stops; patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a "consumed, recovery pending" attempt's quota recovers. **Redeem now** is the manual way out.
 - **Management page** in English and Chinese, reusing the Management Center's saved sign-in.
@@ -57,11 +58,17 @@ Settings can also be given in the plugin's `config_yaml`; values saved from the 
 refresh_interval: 1h                    # patrol interval
 trigger_lead_time: 5m                   # redeem this long before expiry
 auto_reset_on_weekly_exhaustion: false  # global default
+defer_reset_near_weekly_recovery: false # global default: defer weekly-exhaustion
+                                        #   redemption when the same weekly window
+                                        #   recovers within the guard window
+weekly_recovery_guard_window: 24h       # defer window (default 24h, min 1m)
 enabled_accounts: [auth_index_1]
 account_overrides:
   auth_index_1:
     trigger_lead_time: 10m
     auto_reset_on_weekly_exhaustion: true
+    defer_reset_near_weekly_recovery: true
+    weekly_recovery_guard_window: 12h
 state_dir: /absolute/path               # optional state location override
 ```
 
