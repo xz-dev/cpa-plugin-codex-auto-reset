@@ -221,7 +221,9 @@ func configurePlugin(raw []byte) error {
 		// Fresh state: use the config we just parsed.
 		loaded.Config = cfg
 	} else {
-		cfg = loaded.Config
+		// Default fields missing from older saved state (e.g. the 24h guard
+		// window); valid saved durations pass through unchanged.
+		cfg = normalizeConfig(loaded.Config)
 	}
 	// The config_yaml override is authoritative for state_dir across
 	// state.json round-trips (a fresh save persists it for later boots).

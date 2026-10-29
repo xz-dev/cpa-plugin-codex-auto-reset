@@ -5,6 +5,7 @@ package plugin
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -94,6 +95,42 @@ func TestThird_StopAndWaitNeverStartedAndDoubleStop(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("never-started/double stop hung")
+	}
+}
+
+// TestBoot_LegacyStateDefaultsGuardWindow boots through configurePlugin from a
+// state file saved before the natural-recovery guard existed (as on the v0.2.0
+// production host). The missing window must load as 24h with the guard off,
+// saved values must survive, and an ordinary settings save must succeed.
+func TestBoot_LegacyStateDefaultsGuardWindow(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	oldState, oldWorker, oldPath, oldHandlers := globalState, globalWorker, globalStatePath, globalHandlers
+	defer func() {
+		if globalWorker != nil && globalWorker != oldWorker {
+			globalWorker.StopAndWait()
+		}
+		globalState, globalWorker, globalStatePath, globalHandlers = oldState, oldWorker, oldPath, oldHandlers
+	}()
+	globalWorker, globalHandlers = nil, nil
+	dir := t.TempDir()
+	legacy := `{"config":{"refresh_interval":"3h","trigger_lead_time":"5m","auto_reset_on_weekly_exhaustion":true,"enabled_accounts":["a"]},"accounts":{}}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgRaw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_dir: " + dir + "\n")})
+	if err := configurePlugin(cfgRaw); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	got := globalState.Config
+	if got.WeeklyRecoveryGuardWindow != 24*time.Hour || got.DeferResetNearRecovery {
+		t.Fatalf("legacy guard fields: window=%v defer=%v, want 24h/false", got.WeeklyRecoveryGuardWindow, got.DeferResetNearRecovery)
+	}
+	if got.RefreshInterval != 3*time.Hour || !got.AutoResetOnWeeklyExhaust || len(got.EnabledAccounts) != 1 {
+		t.Fatalf("saved legacy fields not preserved: %+v", got)
+	}
+	status, body, _ := globalHandlers.handle(http.MethodPut, "/codex-auto-reset/settings", nil, []byte(`{"enabled_accounts":["a"]}`))
+	if status != http.StatusOK {
+		t.Fatalf("settings save after legacy boot: %d %s", status, body)
 	}
 }
 
