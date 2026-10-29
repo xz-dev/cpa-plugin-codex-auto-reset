@@ -3,6 +3,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -118,6 +119,7 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 	// exhaustion evidence: its weekly window is a dedicated code-review budget,
 	// not the normal weekly quota an exhaustion-based redeem must prove.
 	weeklyUsed := -1.0
+	var weeklyResetAt time.Time
 	for _, rlKey := range []string{"rate_limit", "rateLimit"} {
 		rl, ok := getMapAny(doc, rlKey)
 		if !ok {
@@ -136,6 +138,7 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 			if secs >= 600000 && secs <= 610000 {
 				if used, ok := getFloatAny(win, "used_percent", "usedPercent"); ok {
 					weeklyUsed = used
+					weeklyResetAt = weeklyResetFromWindow(win, now)
 					break
 				}
 			}
@@ -187,6 +190,7 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		WeeklyPct:      weeklyPct,
 		WeeklyUsedPct:  weeklyUsed,
 		WeeklyKnown:    weeklyKnown,
+		WeeklyResetAt:  weeklyResetAt,
 		CapturedAt:     now,
 	}, nil
 }
@@ -227,6 +231,47 @@ func getFloatAny(root map[string]any, keys ...string) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// weeklyResetFromWindow derives the normal weekly window's next recovery
+// time. reset_at (unix seconds) wins when it is a finite, integral,
+// representable value in the future; otherwise a positive integral
+// reset_after_seconds is anchored once to this observation's capture time.
+// A missing, past, fractional, malformed, overflowing, or unserializable
+// field leaves the recovery time unknown (zero) — the guard must then fall
+// through to ordinary exhaustion redemption rather than trusting a
+// fabricated time.
+func weeklyResetFromWindow(win map[string]any, now time.Time) time.Time {
+	if ra, ok := getFloatAny(win, "reset_at", "resetAt"); ok {
+		sec := int64(ra)
+		if ra == float64(sec) && sec > now.Unix() {
+			if t := serializableTime(time.Unix(sec, 0)); !t.IsZero() {
+				return t
+			}
+		}
+	}
+	if rs, ok := getFloatAny(win, "reset_after_seconds", "resetAfterSeconds"); ok {
+		sec := int64(rs)
+		// Bound before multiplying: time.Duration is int64 nanoseconds, so
+		// seconds above ~9.2e9 wrap into the past/near future. Also bound
+		// the resulting year so the snapshot stays JSON-serializable.
+		if rs == float64(sec) && sec > 0 && sec <= math.MaxInt64/int64(time.Second) {
+			if t := serializableTime(now.Add(time.Duration(sec) * time.Second)); !t.IsZero() {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// serializableTime returns t only when it round-trips through the JSON
+// encoding used for persisted snapshots (time.MarshalJSON requires
+// year 0–9999). Anything else is untrustworthy and reported as unknown.
+func serializableTime(t time.Time) time.Time {
+	if t.Year() < 0 || t.Year() > 9999 {
+		return time.Time{}
+	}
+	return t
 }
 
 // parseConsumeResponse parses POST /rate-limit-reset-credits/consume.

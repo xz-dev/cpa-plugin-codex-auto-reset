@@ -308,6 +308,8 @@ func TestUI_AccountControls(t *testing.T) {
 		"move-btn", "restore-btn", "check-btn", "reset-btn",
 		"dragstart", "drop", "rowDrafts",
 		"gWeekly", "auto_reset_on_weekly_exhaustion",
+		"gDefer", "gGuardN", "gGuardU", "defer_reset_near_weekly_recovery",
+		"weekly_recovery_guard_window", "deferAuto", "deferMode", "guardLbl",
 		"lastUpdated", "Check now", "Restore defaults",
 	} {
 		if !strings.Contains(src, want) {

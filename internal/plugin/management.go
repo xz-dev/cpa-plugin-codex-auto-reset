@@ -173,14 +173,18 @@ func (h *managementHandlers) effectivePolicyJSON(authID string) map[string]any {
 	return map[string]any{
 		"auth_index": authID,
 		"effective": map[string]any{
-			"refresh_interval":                formatDuration(p.RefreshInterval),
-			"trigger_lead_time":               formatDuration(p.TriggerLeadTime),
-			"auto_reset_on_weekly_exhaustion": p.AutoResetOnWeeklyExhaust,
+			"refresh_interval":                 formatDuration(p.RefreshInterval),
+			"trigger_lead_time":                formatDuration(p.TriggerLeadTime),
+			"auto_reset_on_weekly_exhaustion":  p.AutoResetOnWeeklyExhaust,
+			"defer_reset_near_weekly_recovery": p.DeferResetNearRecovery,
+			"weekly_recovery_guard_window":     formatDuration(p.WeeklyRecoveryGuardWindow),
 		},
 		"overrides": map[string]any{
-			"refresh_interval":                hasOv && ov.RefreshInterval != nil,
-			"trigger_lead_time":               hasOv && ov.TriggerLeadTime != nil,
-			"auto_reset_on_weekly_exhaustion": hasOv && ov.AutoResetOnWeeklyExhaust != nil,
+			"refresh_interval":                 hasOv && ov.RefreshInterval != nil,
+			"trigger_lead_time":                hasOv && ov.TriggerLeadTime != nil,
+			"auto_reset_on_weekly_exhaustion":  hasOv && ov.AutoResetOnWeeklyExhaust != nil,
+			"defer_reset_near_weekly_recovery": hasOv && ov.DeferResetNearRecovery != nil,
+			"weekly_recovery_guard_window":     hasOv && ov.WeeklyRecoveryGuardWindow != nil,
 		},
 	}
 }
@@ -263,11 +267,13 @@ func (h *managementHandlers) accountsJSON() (int, []byte) {
 // map, when present, REPLACES the whole map (removing an account's entry
 // restores its defaults); when absent it is preserved untouched.
 type settingsRequest struct {
-	RefreshInterval          json.RawMessage             `json:"refresh_interval"`
-	TriggerLeadTime          json.RawMessage             `json:"trigger_lead_time"`
-	EnabledAccounts          *[]string                   `json:"enabled_accounts"`
-	AutoResetOnWeeklyExhaust *bool                       `json:"auto_reset_on_weekly_exhaustion"`
-	AccountOverrides         *map[string]AccountOverride `json:"account_overrides"`
+	RefreshInterval           json.RawMessage             `json:"refresh_interval"`
+	TriggerLeadTime           json.RawMessage             `json:"trigger_lead_time"`
+	EnabledAccounts           *[]string                   `json:"enabled_accounts"`
+	AutoResetOnWeeklyExhaust  *bool                       `json:"auto_reset_on_weekly_exhaustion"`
+	DeferResetNearRecovery    *bool                       `json:"defer_reset_near_weekly_recovery"`
+	WeeklyRecoveryGuardWindow json.RawMessage             `json:"weekly_recovery_guard_window"`
+	AccountOverrides          *map[string]AccountOverride `json:"account_overrides"`
 }
 
 func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
@@ -300,6 +306,16 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	if req.AutoResetOnWeeklyExhaust != nil {
 		cfg.AutoResetOnWeeklyExhaust = *req.AutoResetOnWeeklyExhaust
 	}
+	if req.DeferResetNearRecovery != nil {
+		cfg.DeferResetNearRecovery = *req.DeferResetNearRecovery
+	}
+	if len(req.WeeklyRecoveryGuardWindow) > 0 {
+		d, err := parseDurationJSON(req.WeeklyRecoveryGuardWindow)
+		if err != nil {
+			return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid weekly_recovery_guard_window: " + err.Error()})
+		}
+		cfg.WeeklyRecoveryGuardWindow = d
+	}
 	if req.AccountOverrides != nil {
 		cfg.AccountOverrides = *req.AccountOverrides
 	}
@@ -326,11 +342,13 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		h.OnSettingsChanged()
 	}
 	return jsonOK(map[string]any{
-		"refresh_interval":                formatDuration(cfg.RefreshInterval),
-		"trigger_lead_time":               formatDuration(cfg.TriggerLeadTime),
-		"enabled_accounts":                cfg.EnabledAccounts,
-		"auto_reset_on_weekly_exhaustion": cfg.AutoResetOnWeeklyExhaust,
-		"account_overrides":               cfg.AccountOverrides,
+		"refresh_interval":                 formatDuration(cfg.RefreshInterval),
+		"trigger_lead_time":                formatDuration(cfg.TriggerLeadTime),
+		"enabled_accounts":                 cfg.EnabledAccounts,
+		"auto_reset_on_weekly_exhaustion":  cfg.AutoResetOnWeeklyExhaust,
+		"defer_reset_near_weekly_recovery": cfg.DeferResetNearRecovery,
+		"weekly_recovery_guard_window":     formatDuration(cfg.WeeklyRecoveryGuardWindow),
+		"account_overrides":                cfg.AccountOverrides,
 	})
 }
 
@@ -597,6 +615,14 @@ func renderStatusHTML(state *PluginState) string {
               <input id="gWeekly" type="checkbox" style="margin-right:6px;"><span data-i18n="weeklyAuto">Auto-redeem on weekly exhaustion</span></span>
               <span class="setting-help" data-i18n="weeklyHelp">Off by default. When on, verified 100% normal-weekly usage may redeem early.</span>
             </label>
+            <label class="field"><span class="num-unit" style="justify-content:flex-start;">
+              <input id="gDefer" type="checkbox" style="margin-right:6px;"><span data-i18n="deferAuto">Defer redemption near weekly recovery</span></span>
+              <span class="setting-help" data-i18n="deferHelp">Off by default. When on, a verified weekly exhaustion redeems nothing if the same weekly window recovers within the guard window (default 24 hours). Credit-expiry triggers still redeem first. If no trustworthy recovery time is reported, the exhaustion rule applies unchanged.</span>
+            </label>
+            <label class="field" for="gGuardN"><span data-i18n="guardWin">Deferral guard window</span>
+              <span class="num-unit"><input id="gGuardN" type="number" min="1" step="1"><select id="gGuardU" data-i18n-aria="guardWinUnit" aria-label="Guard window unit"><option value="m" data-i18n="minutes">minutes</option><option value="h" data-i18n="hours">hours</option></select></span>
+              <span class="setting-help" data-i18n="guardWinHelp">Measured to the natural weekly-quota recovery (not credit expiry).</span>
+            </label>
             <div class="actions">
               <button id="saveGlobal" type="button" class="primary" data-i18n="save">Save defaults</button>
             </div>
@@ -682,6 +708,13 @@ func renderStatusHTML(state *PluginState) string {
         leadHelp: "Redeem this long before the reset credit expires. Default 5 minutes.",
         weeklyAuto: "Auto-redeem on weekly exhaustion",
         weeklyHelp: "Off by default. When on, verified 100% normal-weekly usage may redeem early.",
+        deferAuto: "Defer redemption near weekly recovery",
+        deferHelp: "Off by default. When on, a verified weekly exhaustion redeems nothing if the same weekly window recovers within this window (default 24 hours). Credit-expiry triggers still redeem first. If no trustworthy recovery time is reported, the exhaustion rule applies unchanged.",
+        deferMode: "Recovery deferral", guardLbl: "Guard window",
+        guardWin: "Deferral guard window",
+        guardWinHelp: "Measured to the natural weekly-quota recovery (not credit expiry).",
+        guardWinUnit: "Guard window unit", unitLbl: "unit",
+        invalidGuardWindow: "Guard window needs a whole number ≥ 1",
         minutes: "minutes", hours: "hours", save: "Save defaults", saved: "Saved.",
         enabledGroup: "Enabled — auto reset applies", disabledGroup: "Disabled — no automatic resets",
         enable: "Enable", disable: "Disable", checkNow: "Check now", redeemNow: "Redeem now",
@@ -710,6 +743,13 @@ func renderStatusHTML(state *PluginState) string {
         leadHelp: "在重置额度过期前提前多久兑换。默认 5 分钟。",
         weeklyAuto: "周额度耗尽时自动兑换",
         weeklyHelp: "默认关闭。开启后，经核实普通周额度 100% 用尽可能提前兑换。",
+        deferAuto: "临近周额度自然恢复时延迟兑换",
+        deferHelp: "默认关闭。开启后，若同一普通周窗口在此窗口时间内自然恢复（默认 24 小时），已核实的周耗尽不消耗额度。额度到期触发仍优先兑换。若无可靠恢复时间，则按原耗尽规则处理。",
+        deferMode: "恢复延迟", guardLbl: "延迟窗口",
+        guardWin: "恢复延迟窗口",
+        guardWinHelp: "按周额度自然恢复时间计量（非额度过期）。",
+        guardWinUnit: "延迟窗口单位", unitLbl: "单位",
+        invalidGuardWindow: "延迟窗口需输入 ≥1 的整数",
         minutes: "分钟", hours: "小时", save: "保存默认", saved: "已保存。",
         enabledGroup: "已启用 — 自动重置生效", disabledGroup: "已禁用 — 不自动重置",
         enable: "启用", disable: "禁用", checkNow: "立即检查", redeemNow: "立即兑换",
@@ -731,6 +771,7 @@ func renderStatusHTML(state *PluginState) string {
     function t(k) { const l = state.locale; return (I18N[l] && I18N[l][k]) || I18N.en[k] || k; }
     function applyI18n() {
       for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+      for (const el of document.querySelectorAll("[data-i18n-aria]")) el.setAttribute("aria-label", t(el.dataset.i18nAria));
       for (const b of document.querySelectorAll("#localeSwitch button")) {
         b.classList.toggle("active", b.dataset.locale === state.locale);
       }
@@ -859,30 +900,38 @@ func renderStatusHTML(state *PluginState) string {
     function renderGlobal() {
       const c = (state.status && state.status.config) || {};
       // Never clobber a dirty or focused global draft.
-      if (!globalDirty && (!document.activeElement || !["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly"].includes(document.activeElement.id))) {
+      if (!globalDirty && (!document.activeElement || !["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU"].includes(document.activeElement.id))) {
         const rp = durPartsAll(c.refresh_interval || "1h");
         document.getElementById("gRefreshN").value = rp.n; document.getElementById("gRefreshU").value = rp.u;
         const lp = durPartsAll(c.trigger_lead_time || "5m");
         document.getElementById("gLeadN").value = lp.n; document.getElementById("gLeadU").value = lp.u;
         document.getElementById("gWeekly").checked = !!c.auto_reset_on_weekly_exhaustion;
+        document.getElementById("gDefer").checked = !!c.defer_reset_near_weekly_recovery;
+        const gp = durPartsAll(c.weekly_recovery_guard_window || "24h");
+        document.getElementById("gGuardN").value = gp.n; document.getElementById("gGuardU").value = gp.u;
       }
     }
 
-    function unitSelectHTML(id, val, disabled) {
-      return '<select id="' + id + '"' + (disabled ? ' disabled' : '') + '>' +
+    function unitSelectHTML(id, val, disabled, label) {
+      return '<select id="' + id + '"' + (disabled ? ' disabled' : '') +
+        (label ? ' aria-label="' + esc(label) + '"' : '') + '>' +
         '<option value="m"' + (val === "m" ? " selected" : "") + '>' + t("minutes") + '</option>' +
         '<option value="h"' + (val === "h" ? " selected" : "") + '>' + t("hours") + '</option></select>';
     }
-    function durEditorHTML(prefix, effVal, overridden, ovVal) {
+    function durEditorHTML(prefix, effVal, overridden, ovVal, label) {
       // effVal: effective Go duration string. ovVal: override duration or null.
+      // label: localized programmatic name for the number input; the unit
+      // select gets "<label> unit". Pass it — a bare spinbutton/combobox
+      // exposes no accessible name to screen readers.
       const shown = overridden ? durPartsAll(ovVal) : { n: "", u: "m" };
       const hint = overridden
         ? '<span class="inherit-hint">' + t("override") + '</span>'
         : '<span class="inherit-hint">' + t("inherit") + ': ' + esc(effVal) + '</span>';
       return '<span class="num-unit">' +
         '<input id="' + prefix + 'N" type="number" min="1" step="1" value="' + esc(shown.n) + '"' +
+        (label ? ' aria-label="' + esc(label) + '"' : '') +
         (overridden ? '' : ' placeholder="' + esc(durPartsAll(effVal).n) + '"') + '>' +
-        unitSelectHTML(prefix + "U", overridden ? shown.u : durPartsAll(effVal).u, false) +
+        unitSelectHTML(prefix + "U", overridden ? shown.u : durPartsAll(effVal).u, false, label ? label + " " + t("unitLbl") : "") +
         '</span>' + hint;
     }
 
@@ -907,6 +956,8 @@ func renderStatusHTML(state *PluginState) string {
       const ovCfg = (state.status && state.status.config && state.status.config.account_overrides || {})[id] || {};
       const weeklySel = ov.auto_reset_on_weekly_exhaustion
         ? (ovCfg.auto_reset_on_weekly_exhaustion ? "on" : "off") : "inherit";
+      const deferSel = ov.defer_reset_near_weekly_recovery
+        ? (ovCfg.defer_reset_near_weekly_recovery ? "on" : "off") : "inherit";
       const row = document.createElement("div");
       row.className = "acct-row"; row.draggable = true; row.dataset.auth = id;
       row.innerHTML =
@@ -926,6 +977,14 @@ func renderStatusHTML(state *PluginState) string {
               '<option value="on"' + (weeklySel === "on" ? " selected" : "") + '>' + t("onOpt") + '</option>' +
               '<option value="off"' + (weeklySel === "off" ? " selected" : "") + '>' + t("offOpt") + '</option>' +
             '</select></div>' +
+          '<div class="policy-cell"><label for="d_' + id + '">' + t("deferMode") + '</label>' +
+            '<select id="d_' + id + '" aria-label="' + esc(t("deferMode") + " (" + accountLabel(a) + ")") + '">' +
+              '<option value="inherit"' + (deferSel === "inherit" ? " selected" : "") + '>' + t("inheritOpt") + ' (' + (eff.defer_reset_near_weekly_recovery ? t("onOpt") : t("offOpt")) + ')</option>' +
+              '<option value="on"' + (deferSel === "on" ? " selected" : "") + '>' + t("onOpt") + '</option>' +
+              '<option value="off"' + (deferSel === "off" ? " selected" : "") + '>' + t("offOpt") + '</option>' +
+            '</select></div>' +
+          '<div class="policy-cell"><label for="g_' + id + 'N">' + t("guardLbl") + '</label>' +
+            durEditorHTML("g_" + id, eff.weekly_recovery_guard_window || "24h", ov.weekly_recovery_guard_window, ovCfg.weekly_recovery_guard_window, t("guardLbl") + " (" + accountLabel(a) + ")") + '</div>' +
         '</div>' +
         '<div class="card-actions">' +
           '<button class="mini ' + (enabled ? "secondary" : "primary") + ' move-btn" data-auth="' + esc(id) + '" data-dir="' + (enabled ? "off" : "on") + '">' +
@@ -1052,12 +1111,18 @@ func renderStatusHTML(state *PluginState) string {
     async function saveGlobal() {
       const r = partsToDur(document.getElementById("gRefreshN").value, document.getElementById("gRefreshU").value);
       const l = partsToDur(document.getElementById("gLeadN").value, document.getElementById("gLeadU").value);
+      const gwEl = document.getElementById("gGuardN");
+      const gw = partsToDur(gwEl.value, document.getElementById("gGuardU").value);
       const ss = document.getElementById("globalStatus");
+      gwEl.removeAttribute("aria-invalid");
+      if (!gw) { ss.className = "save-status err"; ss.textContent = t("invalidGuardWindow"); gwEl.setAttribute("aria-invalid","true"); return; }
       if (!r || !l) { ss.className = "save-status err"; ss.textContent = t("invalidDuration"); return; }
       const cfg = (state.status && state.status.config) || {};
       const body = {
         refresh_interval: keepOrig(r, cfg.refresh_interval), trigger_lead_time: keepOrig(l, cfg.trigger_lead_time),
         auto_reset_on_weekly_exhaustion: document.getElementById("gWeekly").checked,
+        defer_reset_near_weekly_recovery: document.getElementById("gDefer").checked,
+        weekly_recovery_guard_window: keepOrig(gw, cfg.weekly_recovery_guard_window),
         enabled_accounts: state.accounts.filter(a => a.enabled).map(a => a.auth_index),
         account_overrides: cfg.account_overrides || {}
       };
@@ -1075,16 +1140,22 @@ func renderStatusHTML(state *PluginState) string {
       const entry = {};
       const pn = document.getElementById("p_" + id + "N"), pu = document.getElementById("p_" + id + "U");
       const ln = document.getElementById("l_" + id + "N"), lu = document.getElementById("l_" + id + "U");
-      const wk = document.getElementById("w_" + id);
+      const wk = document.getElementById("w_" + id), df = document.getElementById("d_" + id);
+      const gn = document.getElementById("g_" + id + "N"), gu = document.getElementById("g_" + id + "U");
       const pd = partsToDur(pn.value, pu.value);
       const ld = partsToDur(ln.value, lu.value);
+      const gd = gn && gn.value !== "" ? partsToDur(gn.value, gu.value) : null;
       if (pn.value !== "" && !pd) return { err: "patrol" };
       if (ln.value !== "" && !ld) return { err: "lead" };
+      if (gn && gn.value !== "" && !gd) return { err: "guard" };
       const prevOv = (cfg.account_overrides || {})[id] || {};
       if (pn.value !== "" ) entry.refresh_interval = keepOrig(pd, prevOv.refresh_interval);
       if (ln.value !== "" ) entry.trigger_lead_time = keepOrig(ld, prevOv.trigger_lead_time);
       if (wk.value === "on") entry.auto_reset_on_weekly_exhaustion = true;
       else if (wk.value === "off") entry.auto_reset_on_weekly_exhaustion = false;
+      if (df && df.value === "on") entry.defer_reset_near_weekly_recovery = true;
+      else if (df && df.value === "off") entry.defer_reset_near_weekly_recovery = false;
+      if (gn && gn.value !== "" ) entry.weekly_recovery_guard_window = keepOrig(gd, prevOv.weekly_recovery_guard_window);
       if (Object.keys(entry).length) overrides[id] = entry;
       else delete overrides[id];
       return { overrides: overrides };
@@ -1093,11 +1164,22 @@ func renderStatusHTML(state *PluginState) string {
     async function saveRow(id) {
       const ss = document.getElementById("ss_" + id);
       const got = collectRow(id);
-      if (got.err) { ss.className = "save-status err"; ss.textContent = t("invalidDuration"); return; }
+      const gwEl = document.getElementById("g_" + id + "N");
+      if (gwEl) gwEl.removeAttribute("aria-invalid");
+      if (got.err) {
+        ss.className = "save-status err";
+        // Field-specific feedback: name the guard-window control and flag
+        // it aria-invalid so the error is distinguishable from patrol/lead.
+        ss.textContent = got.err === "guard" ? t("invalidGuardWindow") : t("invalidDuration");
+        if (got.err === "guard" && gwEl) gwEl.setAttribute("aria-invalid","true");
+        return;
+      }
       const cfg = (state.status && state.status.config) || {};
       const body = {
         refresh_interval: cfg.refresh_interval, trigger_lead_time: cfg.trigger_lead_time,
         auto_reset_on_weekly_exhaustion: cfg.auto_reset_on_weekly_exhaustion,
+        defer_reset_near_weekly_recovery: cfg.defer_reset_near_weekly_recovery,
+        weekly_recovery_guard_window: cfg.weekly_recovery_guard_window,
         enabled_accounts: state.accounts.filter(a => a.enabled).map(a => a.auth_index),
         account_overrides: got.overrides
       };
@@ -1117,6 +1199,8 @@ func renderStatusHTML(state *PluginState) string {
       const body = {
         refresh_interval: cfg.refresh_interval, trigger_lead_time: cfg.trigger_lead_time,
         auto_reset_on_weekly_exhaustion: cfg.auto_reset_on_weekly_exhaustion,
+        defer_reset_near_weekly_recovery: cfg.defer_reset_near_weekly_recovery,
+        weekly_recovery_guard_window: cfg.weekly_recovery_guard_window,
         enabled_accounts: state.accounts.filter(a => a.enabled).map(a => a.auth_index),
         account_overrides: overrides
       };
@@ -1133,6 +1217,8 @@ func renderStatusHTML(state *PluginState) string {
       const body = {
         refresh_interval: cfg.refresh_interval, trigger_lead_time: cfg.trigger_lead_time,
         auto_reset_on_weekly_exhaustion: cfg.auto_reset_on_weekly_exhaustion,
+        defer_reset_near_weekly_recovery: cfg.defer_reset_near_weekly_recovery,
+        weekly_recovery_guard_window: cfg.weekly_recovery_guard_window,
         enabled_accounts: next, account_overrides: cfg.account_overrides || {}
       };
       try {
@@ -1211,9 +1297,9 @@ func renderStatusHTML(state *PluginState) string {
       document.addEventListener("input", ev => {
         const el = ev.target;
         if (!(el instanceof Element) || !el.id) return;
-        if (["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly"].includes(el.id)) { globalDirty = true; return; }
-        // Row control ids: p_<id>N|U, l_<id>N|U, w_<id>.
-        const m = /^[pl]_(.+)[NU]$/.exec(el.id) || /^w_(.+)$/.exec(el.id);
+        if (["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU"].includes(el.id)) { globalDirty = true; return; }
+        // Row control ids: p_<id>N|U, l_<id>N|U, g_<id>N|U, w_<id>, d_<id>.
+        const m = /^[plg]_(.+)[NU]$/.exec(el.id) || /^[wd]_(.+)$/.exec(el.id);
         if (m) markRowDirty(m[1]);
       });
       bindDnD();

@@ -76,6 +76,11 @@ type Snapshot struct {
 	// must treat the usage as unknown, never as exhausted.
 	WeeklyUsedPct float64 `json:"weekly_used_pct,omitempty"`
 	WeeklyKnown   bool    `json:"weekly_known,omitempty"`
+	// WeeklyResetAt is the normal weekly window's next natural recovery time,
+	// captured from the same upstream fields that produced WeeklyUsedPct
+	// (reset_at absolute, or reset_after_seconds anchored to CapturedAt).
+	// Zero means recovery time unavailable — a guard cannot trust it.
+	WeeklyResetAt time.Time `json:"weekly_reset_at,omitempty"`
 }
 
 // WeeklyExhausted reports whether this snapshot proves the normal weekly

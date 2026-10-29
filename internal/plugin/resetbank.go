@@ -388,6 +388,7 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		snap.WeeklyPct = usage.WeeklyPct
 		snap.WeeklyUsedPct = usage.WeeklyUsedPct
 		snap.WeeklyKnown = usage.WeeklyKnown
+		snap.WeeklyResetAt = usage.WeeklyResetAt
 		f.lastSnapshot = snap
 	}
 	if f.attempt.Reverify && f.attempt.RedeemRequestID != "" {
@@ -546,6 +547,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		snap.WeeklyPct = usage.WeeklyPct
 		snap.WeeklyUsedPct = usage.WeeklyUsedPct
 		snap.WeeklyKnown = usage.WeeklyKnown
+		snap.WeeklyResetAt = usage.WeeklyResetAt
 	}
 	// Determine the cycle reason. manualReset stays the operator bypass.
 	// Otherwise expiry-driven until proven otherwise; an early trigger
@@ -562,6 +564,12 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		return time.Time{}
 	}
 	if !f.manualReset {
+		// Final authorization time is now: the fresh usage query already ran,
+		// so re-read the clock before comparing recovery against the guard
+		// window and before judging whether the expiry trigger has been
+		// reached. Using the pre-query time could authorize (or defer)
+		// against a stale deadline.
+		now = f.now()
 		expiring := !target.ExpiresAt.IsZero()
 		T := f.triggerTime(target)
 		weeklyOK := f.eff().AutoResetOnWeeklyExhaust && usageErr == nil && usage.WeeklyExhausted()
@@ -569,7 +577,32 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		case expiring && !now.Before(T):
 			// Expiry trigger reached: reason stays expiry.
 		case weeklyOK:
+			// Natural-recovery guard: defer a new exhaustion redemption when
+			// the same normal weekly window recovers within the effective
+			// guard window. The expiry-trigger case above already wins when
+			// reached; a missing or untrustworthy recovery time falls
+			// through to ordinary exhaustion redemption.
+			if f.eff().DeferResetNearRecovery && !usage.WeeklyResetAt.IsZero() &&
+				usage.WeeklyResetAt.After(now) &&
+				usage.WeeklyResetAt.Sub(now) <= f.eff().WeeklyRecoveryGuardWindow {
+				return f.deferNearRecovery(now, target, usage)
+			}
 			reason = CycleReasonWeeklyExhaustion
+			if f.eff().DeferResetNearRecovery {
+				// Guard is enabled but did not defer: make the fallback
+				// explicit in the decision trail so an operator can tell a
+				// redeemed cycle was exhaustion policy, not a successful defer.
+				f.log("info",
+					"natural-recovery guard enabled but weekly recovery time unavailable or beyond window; redeeming under exhaustion policy",
+					"confirm before reset", nil,
+					map[string]any{
+						"guard_fallback":   "recovery time unavailable or outside guard window",
+						"weekly_reset_at":  usage.WeeklyResetAt,
+						"guard_window":     formatDuration(f.eff().WeeklyRecoveryGuardWindow),
+						"credit_id":        target.ID,
+						"weekly_exhausted": usage.WeeklyExhausted(),
+					})
+			}
 		case expiring && f.scheduledCreditID == target.ID:
 			f.state = StateARMED
 			f.nextWake = T
@@ -631,6 +664,46 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			"redeem_request_id":   f.attempt.RedeemRequestID,
 		})
 	return f.now()
+}
+
+// deferNearRecovery declines a fresh weekly-exhaustion redemption because
+// the same normal weekly window recovers inside the configured guard window.
+// No attempt, history, or hold is created and manual redemption is
+// unaffected. Ordinary expiry scheduling is preserved so a credit can never
+// lapse unspent waiting for the next patrol: an expiring target inside the
+// arming threshold is pinned and armed for its trigger time; anything
+// earlier (or a never-expiring credit) returns to normal patrol timing.
+func (f *AccountFSM) deferNearRecovery(now time.Time, target Credit, usage Snapshot) time.Time {
+	window := f.eff().WeeklyRecoveryGuardWindow
+	details := map[string]any{
+		"credit_id":       target.ID,
+		"weekly_reset_at": usage.WeeklyResetAt,
+		"guard_window":    formatDuration(window),
+		"recovery_in":     usage.WeeklyResetAt.Sub(now).String(),
+	}
+	if !target.ExpiresAt.IsZero() {
+		T := f.triggerTime(target)
+		M := f.armThreshold(target)
+		if !now.Before(M) {
+			// Inside the ordinary arming window: pin the credit and sleep to
+			// its expiry trigger so an earlier expiry still redeems.
+			f.scheduledCreditID = target.ID
+			f.scheduledExpiry = target.ExpiresAt
+			f.state = StateARMED
+			f.log("info",
+				fmt.Sprintf("weekly quota recovers at %s (within %s); deferring redemption, credit %s armed for expiry trigger",
+					usage.WeeklyResetAt.Format("15:04:05"), formatDuration(window), shortID(target.ID)),
+				"sleep to trigger time", &T, details)
+			return T
+		}
+	}
+	next := now.Add(f.eff().RefreshInterval)
+	f.state = StateIDLE
+	f.log("info",
+		fmt.Sprintf("weekly quota recovers at %s (within %s); deferring redemption to normal patrol",
+			usage.WeeklyResetAt.Format("15:04:05"), formatDuration(window)),
+		"patrol", &next, details)
+	return next
 }
 
 func (f *AccountFSM) stepRESETTING() time.Time {

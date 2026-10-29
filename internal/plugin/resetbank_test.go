@@ -13,14 +13,15 @@ import (
 // FakeOpenAIClient: same field intent (live credit map, weekly %, scripted
 // consume response, transient-failure injection, wrong-credit deduction hook).
 type fakeClient struct {
-	credits     map[string]*Credit
-	weeklyPct   int
-	weeklyUsed  float64 // raw unrounded normal-weekly used percent
-	weeklyKnown bool    // whether weeklyUsed is trustworthy evidence
-	consumeResp ConsumeResponse
-	consumeErr  error // returned when consumeResp.Code is zero AND failFirstN==0
-	listErr     error // returned by ListAllCredits when set
-	usageErr    error // returned by GetUsage when set
+	credits       map[string]*Credit
+	weeklyPct     int
+	weeklyUsed    float64   // raw unrounded normal-weekly used percent
+	weeklyKnown   bool      // whether weeklyUsed is trustworthy evidence
+	weeklyResetAt time.Time // normal weekly window recovery time (zero = unknown)
+	consumeResp   ConsumeResponse
+	consumeErr    error // returned when consumeResp.Code is zero AND failFirstN==0
+	listErr       error // returned by ListAllCredits when set
+	usageErr      error // returned by GetUsage when set
 
 	listCalls    int
 	usageCalls   int
@@ -42,6 +43,11 @@ type fakeClient struct {
 	// bumping weeklyPct to 100 — scripts a broken/stale server where the
 	// reset succeeds on the credit leg but the quota does not recover.
 	keepQuotaAtPre bool
+
+	// onUsage, when non-nil, runs inside GetUsage after the call counter
+	// increments — lets a test advance the fake clock mid-confirmation to
+	// prove the final decision uses the post-query time.
+	onUsage func()
 }
 
 func (f *fakeClient) ListCredits(CodexCredentials) (Snapshot, error) {
@@ -73,10 +79,13 @@ func (f *fakeClient) ListAllCredits(CodexCredentials) (Snapshot, error) {
 
 func (f *fakeClient) GetUsage(CodexCredentials) (Snapshot, error) {
 	f.usageCalls++
+	if f.onUsage != nil {
+		f.onUsage()
+	}
 	if f.usageErr != nil {
 		return Snapshot{}, f.usageErr
 	}
-	return Snapshot{WeeklyPct: f.weeklyPct, WeeklyUsedPct: f.weeklyUsed, WeeklyKnown: f.weeklyKnown, AvailableCount: countAvail(mapToCredits(f.credits))}, nil
+	return Snapshot{WeeklyPct: f.weeklyPct, WeeklyUsedPct: f.weeklyUsed, WeeklyKnown: f.weeklyKnown, WeeklyResetAt: f.weeklyResetAt, AvailableCount: countAvail(mapToCredits(f.credits))}, nil
 }
 
 func (f *fakeClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeResponse, error) {
