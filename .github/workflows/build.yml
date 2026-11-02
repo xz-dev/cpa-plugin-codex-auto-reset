@@ -135,24 +135,34 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "ARCHIVE_NAME=${PLUGIN_NAME}_${VERSION}_windows_arm64.zip" >> "${GITHUB_ENV}"
 
+      - name: Set up Zig
+        timeout-minutes: 5
+        env:
+          ZIG_VERSION: 0.17.0
+          ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            --output "$archive"
+          echo "${ZIG_SHA256}  ${archive}" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/zig"
+          tar -xJf "$archive" -C "${RUNNER_TEMP}/zig" --strip-components=1
+          echo "${RUNNER_TEMP}/zig" >> "$GITHUB_PATH"
+
       - name: Build Windows ARM64 shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
         env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: .
-          packages: ./cmd/codex-auto-reset
-          targets: windows-arm64
-          out-dir: dist/windows-arm64
-          output: ${{ env.PLUGIN_NAME }}.dll
-          flags: -ldflags=-s -w
-          x-flags: github.com/xz-dev/cpa-plugin-codex-auto-reset/internal/plugin.pluginVersion=${{ steps.release_metadata.outputs.version }}
+          CC: zig cc -target aarch64-windows-gnu
+          CXX: zig c++ -target aarch64-windows-gnu
+        run: |
+          make build VERSION="${VERSION}" GOOS=windows GOARCH=arm64 \
+            PLUGIN_OUTPUT="dist/windows-arm64/${PLUGIN_NAME}.dll"
 
       - name: Package plugin
         run: |
           set -euo pipefail
-          rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_NAME}.h"
           go run ./scripts/package-release \
             -library "dist/windows-arm64/${PLUGIN_NAME}.dll" \
             -archive "dist/${ARCHIVE_NAME}" \
