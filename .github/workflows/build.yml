@@ -99,7 +99,7 @@ jobs:
           if [[ "${{ matrix.goos }}/${{ matrix.goarch }}" == "darwin/arm64" ]]; then
             make build VERSION="${VERSION}" GOOS=darwin GOARCH=arm64 \
               CC="clang -arch arm64" CXX="clang++ -arch arm64"
-            lipo -verify_arch arm64 "dist/${PLUGIN_NAME}.dylib"
+            lipo "dist/${PLUGIN_NAME}.dylib" -verify_arch arm64
             go run ./scripts/package-release \
               -library "dist/${PLUGIN_NAME}.dylib" \
               -archive "dist/${ARCHIVE_NAME}" \
