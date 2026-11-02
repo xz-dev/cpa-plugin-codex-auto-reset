@@ -456,7 +456,21 @@ func afterVerifiedReset(logs *logRing, authID string, rec *ResetRecord) {
 
 // resetRoutingCooldown is a variable so tests can stub the host ABI.
 var resetRoutingCooldown = func(authID string) (pluginapi.HostRoutingResetCooldownResponse, error) {
-	result, err := callHostCallbackABI(pluginabi.MethodHostRoutingResetCooldown, pluginapi.HostRoutingResetCooldownRequest{AuthIndex: authID})
+	auths, err := listAuthsViaHost()
+	if err != nil {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("resolve cooldown auth %q: %w", authID, err)
+	}
+	var authIndex string
+	for _, a := range auths {
+		if authID != "" && (a.ID == authID || a.AuthIndex == authID) {
+			authIndex = strings.TrimSpace(a.AuthIndex)
+			break
+		}
+	}
+	if authIndex == "" {
+		return pluginapi.HostRoutingResetCooldownResponse{}, fmt.Errorf("resolve cooldown auth %q: no matching credential with a usable auth_index", authID)
+	}
+	result, err := callHostCallbackABI(pluginabi.MethodHostRoutingResetCooldown, pluginapi.HostRoutingResetCooldownRequest{AuthIndex: authIndex})
 	if err != nil {
 		return pluginapi.HostRoutingResetCooldownResponse{}, err
 	}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -193,6 +194,187 @@ func TestManagementResponseHeaders_HTMLIsUncacheable(t *testing.T) {
 	jsonHeaders := managementResponseHeaders("application/json")
 	if got := jsonHeaders.Get("Cache-Control"); got != "" {
 		t.Fatalf("JSON responses should not carry HTML cache directives, got %q", got)
+	}
+}
+
+func TestAfterVerifiedReset_UsesCanonicalIndex(t *testing.T) {
+	for _, key := range []string{"codex-a.json", "index-a"} {
+		t.Run(key, func(t *testing.T) {
+			oldState, oldTransport := globalState, hostTransport.Load()
+			t.Cleanup(func() { globalState = oldState; hostTransport.Store(oldTransport) })
+			rec := ResetRecord{AuthID: key, Success: true}
+			globalState = &PluginState{
+				Config:       Config{EnabledAccounts: []string{key}},
+				Accounts:     map[string]AccountRuntime{key: {AuthID: key}},
+				ResetHistory: []ResetRecord{rec},
+			}
+
+			var cleared []string
+			SetHostTransport(func(method string, payload []byte) ([]byte, int, error) {
+				switch method {
+				case pluginabi.MethodHostAuthList:
+					return []byte(`{"ok":true,"result":{"files":[{"id":"codex-b.json","auth_index":"index-b"},{"id":"codex-a.json","auth_index":"index-a"}]}}`), 0, nil
+				case pluginabi.MethodHostRoutingResetCooldown:
+					var req pluginapi.HostRoutingResetCooldownRequest
+					if err := json.Unmarshal(payload, &req); err != nil {
+						t.Fatal(err)
+					}
+					cleared = append(cleared, req.AuthIndex)
+					return []byte(`{"ok":true,"result":{"auth_index":"index-a","models":["gpt-5"]}}`), 0, nil
+				default:
+					t.Fatalf("unexpected host callback: %s", method)
+					return nil, 0, nil
+				}
+			})
+
+			logs := newLogRing(10)
+			afterVerifiedReset(logs, key, &rec)
+			if len(cleared) != 1 || cleared[0] != "index-a" {
+				t.Fatalf("cooldown auth indexes = %v, want [index-a]", cleared)
+			}
+			if entries := logs.all(); len(entries) != 1 || entries[0].Level != "info" || !strings.Contains(entries[0].Message, "1 model") {
+				t.Fatalf("expected cleared-model success log, got %+v", entries)
+			}
+			if len(globalState.Config.EnabledAccounts) != 1 || globalState.Config.EnabledAccounts[0] != key ||
+				len(globalState.Accounts) != 1 || globalState.Accounts[key].AuthID != key ||
+				len(globalState.ResetHistory) != 1 || globalState.ResetHistory[0] != rec {
+				t.Fatal("cooldown clearing changed saved account identity or reset history")
+			}
+		})
+	}
+}
+
+func TestAfterVerifiedReset_HostFailuresPreserveSuccess(t *testing.T) {
+	const authList = `{"ok":true,"result":{"files":[{"id":"codex-a.json","auth_index":"index-a"}]}}`
+	cases := []struct {
+		name, method, response string
+		err                    error
+		wantClears             int
+	}{
+		{name: "missing credential", method: pluginabi.MethodHostAuthList, response: `{"ok":true,"result":{"files":[{"id":"codex-b.json","auth_index":"index-b"}]}}`},
+		{name: "empty index", method: pluginabi.MethodHostAuthList, response: `{"ok":true,"result":{"files":[{"id":"codex-a.json","auth_index":""}]}}`},
+		{name: "whitespace index", method: pluginabi.MethodHostAuthList, response: `{"ok":true,"result":{"files":[{"id":"codex-a.json","auth_index":"  "}]}}`},
+		{name: "list failed", method: pluginabi.MethodHostAuthList, err: errors.New("host list unavailable")},
+		{name: "malformed list", method: pluginabi.MethodHostAuthList, response: `{"ok":true,"result":{"files":42}}`},
+		{name: "unsupported cooldown", method: pluginabi.MethodHostRoutingResetCooldown, response: `{"ok":false,"error":{"code":"unsupported","message":"unsupported host callback"}}`, wantClears: 1},
+		{name: "cooldown failed", method: pluginabi.MethodHostRoutingResetCooldown, err: errors.New("host callback failed"), wantClears: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldState, oldTransport := globalState, hostTransport.Load()
+			t.Cleanup(func() { globalState = oldState; hostTransport.Store(oldTransport) })
+			rec := ResetRecord{AuthID: "codex-a.json", Success: true}
+			globalState = &PluginState{ResetHistory: []ResetRecord{rec}}
+			clears := 0
+			SetHostTransport(func(method string, payload []byte) ([]byte, int, error) {
+				switch method {
+				case pluginabi.MethodHostAuthList:
+				case pluginabi.MethodHostRoutingResetCooldown:
+					clears++
+					var req pluginapi.HostRoutingResetCooldownRequest
+					if err := json.Unmarshal(payload, &req); err != nil || req.AuthIndex != "index-a" {
+						t.Fatalf("unexpected cooldown request %s: %v", payload, err)
+					}
+				default:
+					t.Fatalf("unexpected host callback: %s", method)
+				}
+				if method == tc.method {
+					return []byte(tc.response), 0, tc.err
+				}
+				return []byte(authList), 0, nil
+			})
+			logs := newLogRing(10)
+			afterVerifiedReset(logs, rec.AuthID, &rec)
+			// A later sync without a new verified result must not retry clearing.
+			afterVerifiedReset(logs, rec.AuthID, nil)
+			if clears != tc.wantClears {
+				t.Fatalf("cooldown calls = %d, want %d", clears, tc.wantClears)
+			}
+			if entries := logs.all(); len(entries) != 1 || entries[0].Level != "warn" || !strings.Contains(entries[0].Message, "cooldown") {
+				t.Fatalf("expected cooldown warning, got %+v", entries)
+			}
+			if !rec.Success || len(globalState.ResetHistory) != 1 || globalState.ResetHistory[0] != rec {
+				t.Fatal("host failure changed the verified redemption result")
+			}
+		})
+	}
+}
+
+func TestWorker_ClearsCooldownOnlyAfterReadOnlyRecovery(t *testing.T) {
+	oldState, oldWorker, oldPath, oldTransport := globalState, globalWorker, globalStatePath, hostTransport.Load()
+	oldPersist := lastStatePersist
+	t.Cleanup(func() {
+		globalState, globalWorker, globalStatePath = oldState, oldWorker, oldPath
+		hostTransport.Store(oldTransport)
+		lastStatePersist = oldPersist
+	})
+	const key = "codex-a.json"
+	expiry := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
+	clock := &fakeClock{t: expiry.Add(-10 * time.Minute)}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute,
+		AutoResetOnWeeklyExhaust: true, EnabledAccounts: []string{key}}
+	fc := &fakeClient{
+		credits: map[string]*Credit{
+			"c1": {ID: "c1", Status: "available", ExpiresAt: expiry},
+			"c2": {ID: "c2", Status: "available", ExpiresAt: expiry.Add(48 * time.Hour)},
+		},
+		weeklyPct: 0, weeklyUsed: 100, weeklyKnown: true,
+		consumeResp: ConsumeResponse{Code: ConsumeCodeReset}, keepQuotaAtPre: true,
+	}
+	globalState = &PluginState{Config: cfg, Accounts: map[string]AccountRuntime{}}
+	globalStatePath = filepath.Join(t.TempDir(), "state.json")
+	w := NewWorker(cfg, cfg.EnabledAccounts, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
+	}, clock.Now)
+	globalWorker = w
+	wireWorkerPersistence(w)
+	w.ensureFSM(key)
+
+	clears := 0
+	SetHostTransport(func(method string, payload []byte) ([]byte, int, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return []byte(`{"ok":true,"result":{"files":[{"id":"codex-a.json","auth_index":"index-a"}]}}`), 0, nil
+		case pluginabi.MethodHostRoutingResetCooldown:
+			var req pluginapi.HostRoutingResetCooldownRequest
+			if err := json.Unmarshal(payload, &req); err != nil || req.AuthIndex != "index-a" {
+				t.Fatalf("unexpected cooldown request %s: %v", payload, err)
+			}
+			clears++
+			return []byte(`{"ok":true,"result":{"auth_index":"index-a","models":["gpt-5"]}}`), 0, nil
+		default:
+			t.Fatalf("unexpected host callback: %s", method)
+			return nil, 0, nil
+		}
+	})
+
+	handleUsageRecord(recJSON("codex", key, true, 429, `{"error":{"type":"usage_limit_reached"}}`))
+	w.applyHints()
+	if clears != 0 || fc.consumeCalls != 0 {
+		t.Fatal("failure hint cleared cooldown or consumed a credit")
+	}
+	w.stepAccountSafe(key) // Fresh confirmation.
+	w.stepAccountSafe(key) // Consume acknowledged; recovery is not verified.
+	if clears != 0 || fc.consumeCalls != 1 {
+		t.Fatalf("consume acknowledgement: clears=%d consumes=%d", clears, fc.consumeCalls)
+	}
+	clock.t = w.fsms[key].NextWake()
+	w.stepAccountSafe(key) // Target consumed and count reconciled, quota still exhausted.
+	if clears != 0 || len(globalState.ResetHistory) != 1 || globalState.ResetHistory[0].Success || !globalState.ResetHistory[0].ConsumptionConfirmed {
+		t.Fatalf("partial verification: clears=%d history=%+v", clears, globalState.ResetHistory)
+	}
+
+	fc.weeklyPct, fc.weeklyUsed = 95, 5
+	clock.t = w.fsms[key].NextWake()
+	w.stepAccountSafe(key) // Read-only recovery upgrades the same history record.
+	if clears != 1 || fc.consumeCalls != 1 || len(globalState.ResetHistory) != 1 ||
+		!globalState.ResetHistory[0].Success || globalState.ResetHistory[0].AuthID != key {
+		t.Fatalf("recovery: clears=%d consumes=%d history=%+v", clears, fc.consumeCalls, globalState.ResetHistory)
+	}
+	clock.t = w.fsms[key].NextWake()
+	w.stepAccountSafe(key)
+	if clears != 1 || fc.consumeCalls != 1 {
+		t.Fatalf("later patrol repeated clearing or consumption: clears=%d consumes=%d", clears, fc.consumeCalls)
 	}
 }
 
