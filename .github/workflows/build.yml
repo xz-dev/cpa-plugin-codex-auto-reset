@@ -54,7 +54,7 @@ jobs:
             runner: macos-15-intel
           - goos: darwin
             goarch: arm64
-            runner: macos-15
+            runner: macos-15-intel
           - goos: windows
             goarch: amd64
             runner: windows-2025
@@ -94,7 +94,19 @@ jobs:
           echo "ARCHIVE_NAME=${PLUGIN_NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
 
       - name: Build and package plugin
-        run: make package VERSION="${VERSION}" GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}"
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.goos }}/${{ matrix.goarch }}" == "darwin/arm64" ]]; then
+            make build VERSION="${VERSION}" GOOS=darwin GOARCH=arm64 \
+              CC="clang -arch arm64" CXX="clang++ -arch arm64"
+            lipo -verify_arch arm64 "dist/${PLUGIN_NAME}.dylib"
+            go run ./scripts/package-release \
+              -library "dist/${PLUGIN_NAME}.dylib" \
+              -archive "dist/${ARCHIVE_NAME}" \
+              -checksum "dist/${ARCHIVE_NAME}.sha256"
+          else
+            make package VERSION="${VERSION}" GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}"
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
