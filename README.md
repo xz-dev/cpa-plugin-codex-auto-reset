@@ -15,13 +15,14 @@ The plugin runs inside CPA as a dynamic library. It reads Codex credentials thro
 
 ## What it does
 
-- **Per-account policy.** Global defaults plus an enabled/disabled account list; no account is enabled by default. Each account can override any of the global defaults: patrol interval, lead time, weekly-exhaustion redemption, and natural-recovery deferral with its window. Overrides show the inherited global value, and **Restore defaults** removes them.
+- **Per-account policy.** Global defaults plus an enabled/disabled account list; no account is enabled by default. Each account can override any of the global defaults: patrol interval, lead time, weekly-exhaustion redemption, natural-recovery deferral with its window, and the credit-expiry usage window with its switch. Overrides show the inherited global value, and **Restore defaults** removes them.
 - **Expiry redemption.** Each patrol (default every 1h) finds the soonest-expiring credit, pins its ID and expiry, and waits until expiry minus the lead time (default 5m). It then redeems exactly that credit. It never substitutes another credit and never sends a request after the target has expired.
 - **Weekly-exhaustion redemption (opt-in).** Redeems a credit once a fresh, unrounded reading shows the normal weekly window at `used_percent >= 100`. Ordinary 429s, the separate 5-hour window, code-review limits and unknown usage never trigger it.
+- **Credit-expiry usage window (on by default).** Weekly-exhaustion redemption may only spend a credit that expires within the usage window (default 168h = 7 days, boundary inclusive). A credit that lives longer, or one with no expiry, is kept. Entering the window never spends a credit by itself; the exhaustion rule and natural-recovery deferral still apply. An expiry trigger still wins, even when the lead time is longer than the window. Turn it off (globally or per account) to get the old behavior back. On upgrade, a state without these fields gets the switch on and 168h, so a long-lived credit is no longer spent on weekly exhaustion until it nears expiry.
 - **Natural-recovery deferral (opt-in).** Skips a weekly-exhaustion redemption when the same weekly window will recover on its own within a set window (default 24h, boundary inclusive), so a credit is not spent on quota that is about to return anyway. An expiry trigger still wins. If upstream gives no trustworthy recovery time, the plain exhaustion rule applies.
 - **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is listed as `redeemed`/`consumed`/`used` or with a `redeemed_at` time. Success also requires the available count to drop by one and the weekly quota to recover. Transient errors are retried with the same idempotency key, so a retry cannot redeem twice.
 - **Automatic-spending hold.** Any unclear outcome stops automatic redemption for that account. Patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a redemption that already used its credit sees the account's quota come back.
-- **Manual control.** **Check now** runs an immediate read-only patrol. **Redeem now** redeems the soonest-expiring credit after confirmation; it bypasses deferral and is the manual way out of a hold.
+- **Manual control.** **Check now** runs an immediate read-only patrol. **Redeem now** redeems the soonest-expiring credit after confirmation; it bypasses deferral and the usage window and is the manual way out of a hold.
 - **History and logs.** Every redemption is recorded in a reset-statistics panel. Recent log entries (up to 1000, kept 7 days) appear on the page.
 - **Durable state.** Settings, per-account state, history and logs survive CPA restarts and container recreates. The state file holds no tokens, keeps a backup copy, and quarantines a corrupt file instead of overwriting it.
 - **Export and import.** The management API exports the plugin state as JSON and imports it again. Import restores settings and history, never runtime holds.
@@ -71,6 +72,8 @@ trigger_lead_time: 5m                    # redeem this long before expiry
 auto_reset_on_weekly_exhaustion: false   # redeem when the weekly quota is used up
 defer_reset_near_weekly_recovery: false  # ...unless it recovers on its own soon
 weekly_recovery_guard_window: 24h        # how soon counts as "soon" (min 1m)
+limit_weekly_reset_to_expiry_window: true # exhaustion may only use a credit near expiry
+credit_expiry_usage_window: 168h         # "near expiry" = expires within this (7 days, min 1m)
 enabled_accounts: [auth_index_1]
 account_overrides:                       # any setting above, per account
   auth_index_1:
@@ -78,6 +81,7 @@ account_overrides:                       # any setting above, per account
     auto_reset_on_weekly_exhaustion: true
     defer_reset_near_weekly_recovery: true
     weekly_recovery_guard_window: 12h
+    credit_expiry_usage_window: 72h      # switch inherited; add limit_weekly_reset_to_expiry_window: false to disable for this account
 state_dir: /absolute/path                # optional state location override
 ```
 

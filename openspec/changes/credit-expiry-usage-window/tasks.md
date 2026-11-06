@@ -1,0 +1,26 @@
+## 1. Configuration and persistence
+
+- [x] 1.1 Add `limit_weekly_reset_to_expiry_window` and `credit_expiry_usage_window` to global configuration, sparse account overrides, effective policy, serializers, and override emptiness detection; verify configuration tests cover the enabled / 168-hour defaults, independent switch/window inheritance, explicit account false, and clearing either override.
+- [x] 1.2 Make JSON and YAML loading distinguish omitted settings from explicit false, and preserve fields across saved-state load, restart, import, and export; verify missing fields adopt the enabled 7-day default, saved false/custom durations survive, and existing recovery settings, enabled accounts, history, holds, and active attempts remain intact.
+- [x] 1.3 Extend settings requests, responses, effective-policy values, override flags, and atomic duration validation; verify omitted global fields preserve saved values, explicit account-map replacement restores inheritance, invalid global/account windows are rejected even when disabled, and a 10-day lead with a 7-day usage window is accepted.
+
+## 2. Automatic redemption and waiting
+
+- [x] 2.1 Add the usage-window restriction only to new final weekly-exhaustion authorizations, using the confirmed selected credit and final current time; verify no consume outside the window, eligibility inside and exactly at 168 hours, blocking of no-expiry credits when enabled, prior eligibility when disabled, and rejection when final expiry evidence moves the credit outside the window.
+- [x] 2.2 Preserve expiry-trigger precedence and existing manual/hold/target safeguards without filtering the shared available-credit list; verify a 10-day expiry lead wins over a 7-day usage window even without weekly exhaustion, manual authorization bypasses the new restriction, and disabled accounts, held accounts, expired credits, and unavailable pinned targets retain their existing protections.
+- [x] 2.3 Reuse expiry-aware deferral scheduling with a credit-window-specific non-consumption explanation; verify blocked exhaustion returns to patrol or an existing expiry arm without a busy loop, keeps the pinned target, and does not postpone an expiry trigger when the patrol interval is longer than the remaining trigger delay.
+- [x] 2.4 Preserve the existing natural-recovery guard unchanged while composing both restrictions; verify recovery inside and exactly at the guard window still defers, recovery beyond it permits otherwise eligible use, missing/untrustworthy recovery time keeps its existing fallback, and disabling either restriction leaves the other effective.
+- [x] 2.5 Keep policy changes outside already authorized consume/retry/verification attempts; verify enabling or tightening the restriction during an active attempt does not replace its target or idempotency key, cancel its existing reconciliation, or create another consume cycle.
+
+## 3. Management interface and documentation
+
+- [x] 3.1 Add the global checkbox/duration and account inherit/on/off/duration controls using the existing duration editors and settings flow; verify initial enabled / 168-hour display, account-specific disable and custom duration round-trips, independently clearing overrides, and restore-defaults actions that do not themselves consume credits.
+- [x] 3.2 Extend English and Chinese labels/help and operator-visible decision explanations; verify the UI distinguishes credit usage eligibility, expiry triggering, and weekly recovery, explains expiry precedence and both enabled restrictions, and reports outside-window waiting without implying consumption or quota recovery.
+- [x] 3.3 Preserve draft edits and field-level feedback when adding the controls; verify status polling does not discard unsaved switch/window/inheritance edits, invalid saves leave the previous policy active, and saving a duration alone does not enable a restriction or weekly-exhaustion redemption.
+- [x] 3.4 Update `README.md`, `README.zh.md`, and `docs/reference.md` with the new fields, 168-hour default, global/account examples, intentional upgrade behavior, no-expiry behavior, manual bypass, and disable-based rollback; verify examples use supported duration syntax and describe the existing recovery boundary and fallback without changing them.
+
+## 4. Integration verification
+
+- [x] 4.1 Align only affected existing fixtures with their intended usage policy, keeping the existing recovery boundary/fallback expectations intact; run `go test ./internal/plugin/...` and verify all new configuration, API, UI, policy-composition, scheduling, and lifecycle regressions pass.
+- [x] 4.2 Run `go test ./...` and `go test -race ./internal/plugin/...`; verify the complete suite, including existing simulator coverage, remains green without introducing a duplicate policy implementation into the standalone simulator.
+- [x] 4.3 Exercise the management page using the existing UI development/test harness in both languages: save global settings, override and clear one account, preserve edits during polling, and observe a blocked outside-window account; verify the displayed effective policy and waiting explanation match the saved values, and confirm documented expiry-priority cases are covered by automated consumption-call assertions.

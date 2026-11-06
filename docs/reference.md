@@ -18,7 +18,10 @@ CONFIRMING → re-list credits; validate the pinned target is still available
              reading under an effective opt-in authorizes the cycle reason
              "weekly_exhaustion" — otherwise re-arm for expiry. Fetch usage,
              pin the target's expected expiry, mint a redeem_request_id,
-             enter RESETTING. With defer_reset_near_weekly_recovery enabled
+             enter RESETTING. With limit_weekly_reset_to_expiry_window on
+             (default) a weekly-exhaustion cycle also needs the target to
+             expire within credit_expiry_usage_window (default 168h), or it
+             defers. With defer_reset_near_weekly_recovery enabled
              a fresh weekly recovery inside weekly_recovery_guard_window
              defers instead of consuming — a credit still due within its
              arming window stays pinned and armed for its expiry trigger.
@@ -35,7 +38,9 @@ DONE       → cycle complete; back to IDLE
 
 Natural-recovery deferral (opt-in, default off): when `defer_reset_near_weekly_recovery` is on for an account, a CONFIRMING step that would newly authorize a weekly-exhaustion cycle first checks the same normal weekly window's recovery time (`reset_at`, or `reset_after_seconds` anchored at the usage capture). If that recovery lies in the future and within the effective `weekly_recovery_guard_window` (default 24 hours, inclusive boundary), nothing is consumed — no attempt, history, or hold — and the credit keeps its ordinary expiry schedule: inside the arming window it is pinned and armed for its trigger time, otherwise the next patrol re-evaluates. Missing, past, or untrustworthy recovery time falls back to the ordinary exhaustion rule rather than deferring; expiry triggers already reached win outright. Manual **Redeem now** bypasses the guard.
 
-An automatic cycle never substitutes another credit if its pinned target is redeemed, removed, or expired, even if another credit is already due. A missing target ID also abandons the cycle. Expiry mode never redeems credits with no expiry; if the pinned target becomes non-expiring, that expiry cycle is abandoned. An account opted in to weekly-exhaustion mode may redeem a non-expiring credit (sorted last) after freshly confirmed weekly exhaustion. The next IDLE patrol can schedule a new cycle normally.
+Credit-expiry usage window (on by default): when the effective `limit_weekly_reset_to_expiry_window` is on, a CONFIRMING step that would newly authorize a weekly-exhaustion cycle first requires the selected credit, as re-listed at that step and judged against the clock read after the fresh usage query, to have a known expiry no more than the effective `credit_expiry_usage_window` away (default 168 hours = 7 days, inclusive boundary). A longer-lived or non-expiring credit is kept: nothing is consumed — no attempt, history, or hold — the decision is logged as "outside the … credit-expiry usage window", and the credit keeps its ordinary expiry schedule exactly as for natural-recovery deferral. Entering the window never authorizes a cycle by itself. The check runs before natural-recovery deferral; both must pass, and the deferral's boundary and missing-time fallback are unchanged. Expiry triggers already reached win outright, even when `trigger_lead_time` is longer than the window. Manual **Redeem now** bypasses it, and policy changes never touch an attempt already minted. A saved state or `config_yaml` without these fields loads with the switch on and 168h; an explicit `false` is kept. Disabling the switch (globally or per account) restores the previous exhaustion behavior — the rollback path; an older binary would not enforce or preserve these fields.
+
+An automatic cycle never substitutes another credit if its pinned target is redeemed, removed, or expired, even if another credit is already due. A missing target ID also abandons the cycle. Expiry mode never redeems credits with no expiry; if the pinned target becomes non-expiring, that expiry cycle is abandoned. An account opted in to weekly-exhaustion mode with the credit-expiry usage window switched off may redeem a non-expiring credit (sorted last) after freshly confirmed weekly exhaustion. The next IDLE patrol can schedule a new cycle normally.
 
 **Check** (including Check All) pulls only IDLE accounts to an immediate patrol; it never authorizes an early reset and does not grant manual authority. **Check now** in the page uses this path, unlike page status polling, which only reads saved plugin state. Accounts inside an active cycle (armed, retrying, verifying) keep their schedule — confirmation still rechecks the target's current expiry and waits until its updated trigger time, so an early wake cannot bypass it. **Reset** explicitly requests immediate manual confirmation, clears the old automatic target, and selects the currently soonest-expiring available credit, even far before its trigger time (or with no expiry). It still runs the full confirm, consume, and verify flow. Repeated Reset requests during consume/retry or verification leave that active attempt intact. Returning to IDLE clears both the pinned target and manual intent.
 
@@ -82,7 +87,9 @@ Docker note: with the default auth-dir location, mounting your auth dir (you alr
 GET  /v0/resource/plugins/codex-auto-reset/status            # resource page (read-only HTML)
 GET  /v0/management/plugins/codex-auto-reset/status          # JSON status (config + accounts)
 GET  /v0/management/plugins/codex-auto-reset/logs            # recent log entries
-PUT  /v0/management/plugins/codex-auto-reset/settings        # update config fields (presence-aware merge)
+PUT  /v0/management/plugins/codex-auto-reset/settings        # update config fields (presence-aware merge;
+                                                             # includes limit_weekly_reset_to_expiry_window
+                                                             # and credit_expiry_usage_window, min 1m)
 POST /v0/management/plugins/codex-auto-reset/check           # manual check; body {auth_index}
 POST /v0/management/plugins/codex-auto-reset/check/all       # manual check all accounts
 POST /v0/management/plugins/codex-auto-reset/reset           # manual reset; body {auth_index}
