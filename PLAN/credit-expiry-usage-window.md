@@ -1,6 +1,6 @@
 # credit-expiry-usage-window
 
-Contract: `openspec/changes/credit-expiry-usage-window/` (proposal, specs, design, tasks).
+Contract: `openspec/changes/archive/2026-11-06-credit-expiry-usage-window/` (proposal, specs, design, tasks).
 Branch: `feat/credit-expiry-usage-window` (no commits until parent review).
 
 ## Seams
