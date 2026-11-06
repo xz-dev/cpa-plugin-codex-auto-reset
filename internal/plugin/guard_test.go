@@ -379,7 +379,8 @@ func TestGuard_ConfigRoundTrip(t *testing.T) {
 // TestGuard_ValidateSettings: sub-minute guard windows are rejected even
 // when the guard switch is off.
 func TestGuard_ValidateSettings(t *testing.T) {
-	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, WeeklyRecoveryGuardWindow: 30 * time.Second}
+	cfg := Config{RefreshInterval: time.Hour, TriggerLeadTime: 5 * time.Minute, WeeklyRecoveryGuardWindow: 30 * time.Second,
+		CreditExpiryUsageWindow: DefaultCreditExpiryUsageWindow}
 	if err := validateSettings(cfg); err == nil {
 		t.Fatal("30s global window must be rejected")
 	}

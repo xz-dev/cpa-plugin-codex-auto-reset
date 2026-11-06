@@ -173,18 +173,22 @@ func (h *managementHandlers) effectivePolicyJSON(authID string) map[string]any {
 	return map[string]any{
 		"auth_index": authID,
 		"effective": map[string]any{
-			"refresh_interval":                 formatDuration(p.RefreshInterval),
-			"trigger_lead_time":                formatDuration(p.TriggerLeadTime),
-			"auto_reset_on_weekly_exhaustion":  p.AutoResetOnWeeklyExhaust,
-			"defer_reset_near_weekly_recovery": p.DeferResetNearRecovery,
-			"weekly_recovery_guard_window":     formatDuration(p.WeeklyRecoveryGuardWindow),
+			"refresh_interval":                    formatDuration(p.RefreshInterval),
+			"trigger_lead_time":                   formatDuration(p.TriggerLeadTime),
+			"auto_reset_on_weekly_exhaustion":     p.AutoResetOnWeeklyExhaust,
+			"defer_reset_near_weekly_recovery":    p.DeferResetNearRecovery,
+			"weekly_recovery_guard_window":        formatDuration(p.WeeklyRecoveryGuardWindow),
+			"limit_weekly_reset_to_expiry_window": p.LimitWeeklyResetToExpiryWindow,
+			"credit_expiry_usage_window":          formatDuration(p.CreditExpiryUsageWindow),
 		},
 		"overrides": map[string]any{
-			"refresh_interval":                 hasOv && ov.RefreshInterval != nil,
-			"trigger_lead_time":                hasOv && ov.TriggerLeadTime != nil,
-			"auto_reset_on_weekly_exhaustion":  hasOv && ov.AutoResetOnWeeklyExhaust != nil,
-			"defer_reset_near_weekly_recovery": hasOv && ov.DeferResetNearRecovery != nil,
-			"weekly_recovery_guard_window":     hasOv && ov.WeeklyRecoveryGuardWindow != nil,
+			"refresh_interval":                    hasOv && ov.RefreshInterval != nil,
+			"trigger_lead_time":                   hasOv && ov.TriggerLeadTime != nil,
+			"auto_reset_on_weekly_exhaustion":     hasOv && ov.AutoResetOnWeeklyExhaust != nil,
+			"defer_reset_near_weekly_recovery":    hasOv && ov.DeferResetNearRecovery != nil,
+			"weekly_recovery_guard_window":        hasOv && ov.WeeklyRecoveryGuardWindow != nil,
+			"limit_weekly_reset_to_expiry_window": hasOv && ov.LimitWeeklyResetToExpiryWindow != nil,
+			"credit_expiry_usage_window":          hasOv && ov.CreditExpiryUsageWindow != nil,
 		},
 	}
 }
@@ -267,13 +271,15 @@ func (h *managementHandlers) accountsJSON() (int, []byte) {
 // map, when present, REPLACES the whole map (removing an account's entry
 // restores its defaults); when absent it is preserved untouched.
 type settingsRequest struct {
-	RefreshInterval           json.RawMessage             `json:"refresh_interval"`
-	TriggerLeadTime           json.RawMessage             `json:"trigger_lead_time"`
-	EnabledAccounts           *[]string                   `json:"enabled_accounts"`
-	AutoResetOnWeeklyExhaust  *bool                       `json:"auto_reset_on_weekly_exhaustion"`
-	DeferResetNearRecovery    *bool                       `json:"defer_reset_near_weekly_recovery"`
-	WeeklyRecoveryGuardWindow json.RawMessage             `json:"weekly_recovery_guard_window"`
-	AccountOverrides          *map[string]AccountOverride `json:"account_overrides"`
+	RefreshInterval                json.RawMessage             `json:"refresh_interval"`
+	TriggerLeadTime                json.RawMessage             `json:"trigger_lead_time"`
+	EnabledAccounts                *[]string                   `json:"enabled_accounts"`
+	AutoResetOnWeeklyExhaust       *bool                       `json:"auto_reset_on_weekly_exhaustion"`
+	DeferResetNearRecovery         *bool                       `json:"defer_reset_near_weekly_recovery"`
+	WeeklyRecoveryGuardWindow      json.RawMessage             `json:"weekly_recovery_guard_window"`
+	LimitWeeklyResetToExpiryWindow *bool                       `json:"limit_weekly_reset_to_expiry_window"`
+	CreditExpiryUsageWindow        json.RawMessage             `json:"credit_expiry_usage_window"`
+	AccountOverrides               *map[string]AccountOverride `json:"account_overrides"`
 }
 
 func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
@@ -316,6 +322,16 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		}
 		cfg.WeeklyRecoveryGuardWindow = d
 	}
+	if req.LimitWeeklyResetToExpiryWindow != nil {
+		cfg.LimitWeeklyResetToExpiryWindow = *req.LimitWeeklyResetToExpiryWindow
+	}
+	if len(req.CreditExpiryUsageWindow) > 0 {
+		d, err := parseDurationJSON(req.CreditExpiryUsageWindow)
+		if err != nil {
+			return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid credit_expiry_usage_window: " + err.Error()})
+		}
+		cfg.CreditExpiryUsageWindow = d
+	}
 	if req.AccountOverrides != nil {
 		cfg.AccountOverrides = *req.AccountOverrides
 	}
@@ -342,13 +358,15 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 		h.OnSettingsChanged()
 	}
 	return jsonOK(map[string]any{
-		"refresh_interval":                 formatDuration(cfg.RefreshInterval),
-		"trigger_lead_time":                formatDuration(cfg.TriggerLeadTime),
-		"enabled_accounts":                 cfg.EnabledAccounts,
-		"auto_reset_on_weekly_exhaustion":  cfg.AutoResetOnWeeklyExhaust,
-		"defer_reset_near_weekly_recovery": cfg.DeferResetNearRecovery,
-		"weekly_recovery_guard_window":     formatDuration(cfg.WeeklyRecoveryGuardWindow),
-		"account_overrides":                cfg.AccountOverrides,
+		"refresh_interval":                    formatDuration(cfg.RefreshInterval),
+		"trigger_lead_time":                   formatDuration(cfg.TriggerLeadTime),
+		"enabled_accounts":                    cfg.EnabledAccounts,
+		"auto_reset_on_weekly_exhaustion":     cfg.AutoResetOnWeeklyExhaust,
+		"defer_reset_near_weekly_recovery":    cfg.DeferResetNearRecovery,
+		"weekly_recovery_guard_window":        formatDuration(cfg.WeeklyRecoveryGuardWindow),
+		"limit_weekly_reset_to_expiry_window": cfg.LimitWeeklyResetToExpiryWindow,
+		"credit_expiry_usage_window":          formatDuration(cfg.CreditExpiryUsageWindow),
+		"account_overrides":                   cfg.AccountOverrides,
 	})
 }
 
@@ -623,6 +641,14 @@ func renderStatusHTML(state *PluginState) string {
               <span class="num-unit"><input id="gGuardN" type="number" min="1" step="1"><select id="gGuardU" data-i18n-aria="guardWinUnit" aria-label="Guard window unit"><option value="m" data-i18n="minutes">minutes</option><option value="h" data-i18n="hours">hours</option></select></span>
               <span class="setting-help" data-i18n="guardWinHelp">Measured to the natural weekly-quota recovery (not credit expiry).</span>
             </label>
+            <label class="field"><span class="num-unit" style="justify-content:flex-start;">
+              <input id="gLimit" type="checkbox" style="margin-right:6px;"><span data-i18n="limitAuto">Only redeem on weekly exhaustion near credit expiry</span></span>
+              <span class="setting-help" data-i18n="limitHelp">On by default. A verified weekly exhaustion may only spend a credit that expires within the usage window (default 168 hours = 7 days). Entering the window never spends a credit by itself; the exhaustion rule and the weekly-recovery deferral above still apply. Credit-expiry triggers always redeem first, and Redeem now is not limited.</span>
+            </label>
+            <label class="field" for="gUsageN"><span data-i18n="usageWin">Credit-expiry usage window</span>
+              <span class="num-unit"><input id="gUsageN" type="number" min="1" step="1"><select id="gUsageU" data-i18n-aria="usageWinUnit" aria-label="Usage window unit"><option value="m" data-i18n="minutes">minutes</option><option value="h" data-i18n="hours">hours</option></select></span>
+              <span class="setting-help" data-i18n="usageWinHelp">Measured to the reset credit's expiry (not weekly recovery): the longest remaining credit lifetime that still allows exhaustion redemption. It is not a trigger.</span>
+            </label>
             <div class="actions">
               <button id="saveGlobal" type="button" class="primary" data-i18n="save">Save defaults</button>
             </div>
@@ -715,6 +741,12 @@ func renderStatusHTML(state *PluginState) string {
         guardWinHelp: "Measured to the natural weekly-quota recovery (not credit expiry).",
         guardWinUnit: "Guard window unit", unitLbl: "unit",
         invalidGuardWindow: "Guard window needs a whole number ≥ 1",
+        limitAuto: "Only redeem on weekly exhaustion near credit expiry",
+        limitHelp: "On by default. A verified weekly exhaustion may only spend a credit that expires within the usage window (default 168 hours = 7 days). Entering the window never spends a credit by itself; the exhaustion rule and the weekly-recovery deferral above still apply. Credit-expiry triggers always redeem first, and Redeem now is not limited.",
+        usageWin: "Credit-expiry usage window", usageLbl: "Usage window", limitMode: "Expiry-window limit",
+        usageWinHelp: "Measured to the reset credit's expiry (not weekly recovery): the longest remaining credit lifetime that still allows exhaustion redemption. It is not a trigger.",
+        usageWinUnit: "Usage window unit",
+        invalidUsageWindow: "Usage window needs a whole number ≥ 1",
         minutes: "minutes", hours: "hours", save: "Save defaults", saved: "Saved.",
         enabledGroup: "Enabled — auto reset applies", disabledGroup: "Disabled — no automatic resets",
         enable: "Enable", disable: "Disable", checkNow: "Check now", redeemNow: "Redeem now",
@@ -750,6 +782,12 @@ func renderStatusHTML(state *PluginState) string {
         guardWinHelp: "按周额度自然恢复时间计量（非额度过期）。",
         guardWinUnit: "延迟窗口单位", unitLbl: "单位",
         invalidGuardWindow: "延迟窗口需输入 ≥1 的整数",
+        limitAuto: "仅在额度临近过期时允许周耗尽兑换",
+        limitHelp: "默认开启。已核实的周耗尽只会使用在用卡窗口内过期的额度（默认 168 小时 = 7 天）。进入窗口本身不会消耗额度；周耗尽规则和上面的周恢复延迟仍然适用。额度到期触发始终优先兑换，「立即兑换」不受此限制。",
+        usageWin: "临期用卡窗口", usageLbl: "用卡窗口", limitMode: "临期限制",
+        usageWinHelp: "按重置额度的过期时间计量（非周额度恢复）：额度剩余有效期不超过此值时才允许周耗尽兑换。它不会触发兑换。",
+        usageWinUnit: "用卡窗口单位",
+        invalidUsageWindow: "用卡窗口需输入 ≥1 的整数",
         minutes: "分钟", hours: "小时", save: "保存默认", saved: "已保存。",
         enabledGroup: "已启用 — 自动重置生效", disabledGroup: "已禁用 — 不自动重置",
         enable: "启用", disable: "禁用", checkNow: "立即检查", redeemNow: "立即兑换",
@@ -900,7 +938,7 @@ func renderStatusHTML(state *PluginState) string {
     function renderGlobal() {
       const c = (state.status && state.status.config) || {};
       // Never clobber a dirty or focused global draft.
-      if (!globalDirty && (!document.activeElement || !["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU"].includes(document.activeElement.id))) {
+      if (!globalDirty && (!document.activeElement || !["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU","gLimit","gUsageN","gUsageU"].includes(document.activeElement.id))) {
         const rp = durPartsAll(c.refresh_interval || "1h");
         document.getElementById("gRefreshN").value = rp.n; document.getElementById("gRefreshU").value = rp.u;
         const lp = durPartsAll(c.trigger_lead_time || "5m");
@@ -909,6 +947,9 @@ func renderStatusHTML(state *PluginState) string {
         document.getElementById("gDefer").checked = !!c.defer_reset_near_weekly_recovery;
         const gp = durPartsAll(c.weekly_recovery_guard_window || "24h");
         document.getElementById("gGuardN").value = gp.n; document.getElementById("gGuardU").value = gp.u;
+        document.getElementById("gLimit").checked = c.limit_weekly_reset_to_expiry_window !== false;
+        const up = durPartsAll(c.credit_expiry_usage_window || "168h");
+        document.getElementById("gUsageN").value = up.n; document.getElementById("gUsageU").value = up.u;
       }
     }
 
@@ -958,6 +999,8 @@ func renderStatusHTML(state *PluginState) string {
         ? (ovCfg.auto_reset_on_weekly_exhaustion ? "on" : "off") : "inherit";
       const deferSel = ov.defer_reset_near_weekly_recovery
         ? (ovCfg.defer_reset_near_weekly_recovery ? "on" : "off") : "inherit";
+      const limitSel = ov.limit_weekly_reset_to_expiry_window
+        ? (ovCfg.limit_weekly_reset_to_expiry_window ? "on" : "off") : "inherit";
       const row = document.createElement("div");
       row.className = "acct-row"; row.draggable = true; row.dataset.auth = id;
       row.innerHTML =
@@ -985,6 +1028,14 @@ func renderStatusHTML(state *PluginState) string {
             '</select></div>' +
           '<div class="policy-cell"><label for="g_' + id + 'N">' + t("guardLbl") + '</label>' +
             durEditorHTML("g_" + id, eff.weekly_recovery_guard_window || "24h", ov.weekly_recovery_guard_window, ovCfg.weekly_recovery_guard_window, t("guardLbl") + " (" + accountLabel(a) + ")") + '</div>' +
+          '<div class="policy-cell"><label for="x_' + id + '">' + t("limitMode") + '</label>' +
+            '<select id="x_' + id + '" aria-label="' + esc(t("limitMode") + " (" + accountLabel(a) + ")") + '">' +
+              '<option value="inherit"' + (limitSel === "inherit" ? " selected" : "") + '>' + t("inheritOpt") + ' (' + (eff.limit_weekly_reset_to_expiry_window ? t("onOpt") : t("offOpt")) + ')</option>' +
+              '<option value="on"' + (limitSel === "on" ? " selected" : "") + '>' + t("onOpt") + '</option>' +
+              '<option value="off"' + (limitSel === "off" ? " selected" : "") + '>' + t("offOpt") + '</option>' +
+            '</select></div>' +
+          '<div class="policy-cell"><label for="u_' + id + 'N">' + t("usageLbl") + '</label>' +
+            durEditorHTML("u_" + id, eff.credit_expiry_usage_window || "168h", ov.credit_expiry_usage_window, ovCfg.credit_expiry_usage_window, t("usageLbl") + " (" + accountLabel(a) + ")") + '</div>' +
         '</div>' +
         '<div class="card-actions">' +
           '<button class="mini ' + (enabled ? "secondary" : "primary") + ' move-btn" data-auth="' + esc(id) + '" data-dir="' + (enabled ? "off" : "on") + '">' +
@@ -1115,7 +1166,11 @@ func renderStatusHTML(state *PluginState) string {
       const gw = partsToDur(gwEl.value, document.getElementById("gGuardU").value);
       const ss = document.getElementById("globalStatus");
       gwEl.removeAttribute("aria-invalid");
+      const uwEl = document.getElementById("gUsageN");
+      const uw = partsToDur(uwEl.value, document.getElementById("gUsageU").value);
+      uwEl.removeAttribute("aria-invalid");
       if (!gw) { ss.className = "save-status err"; ss.textContent = t("invalidGuardWindow"); gwEl.setAttribute("aria-invalid","true"); return; }
+      if (!uw) { ss.className = "save-status err"; ss.textContent = t("invalidUsageWindow"); uwEl.setAttribute("aria-invalid","true"); return; }
       if (!r || !l) { ss.className = "save-status err"; ss.textContent = t("invalidDuration"); return; }
       const cfg = (state.status && state.status.config) || {};
       const body = {
@@ -1123,6 +1178,8 @@ func renderStatusHTML(state *PluginState) string {
         auto_reset_on_weekly_exhaustion: document.getElementById("gWeekly").checked,
         defer_reset_near_weekly_recovery: document.getElementById("gDefer").checked,
         weekly_recovery_guard_window: keepOrig(gw, cfg.weekly_recovery_guard_window),
+        limit_weekly_reset_to_expiry_window: document.getElementById("gLimit").checked,
+        credit_expiry_usage_window: keepOrig(uw, cfg.credit_expiry_usage_window),
         enabled_accounts: state.accounts.filter(a => a.enabled).map(a => a.auth_index),
         account_overrides: cfg.account_overrides || {}
       };
@@ -1142,12 +1199,16 @@ func renderStatusHTML(state *PluginState) string {
       const ln = document.getElementById("l_" + id + "N"), lu = document.getElementById("l_" + id + "U");
       const wk = document.getElementById("w_" + id), df = document.getElementById("d_" + id);
       const gn = document.getElementById("g_" + id + "N"), gu = document.getElementById("g_" + id + "U");
+      const xs = document.getElementById("x_" + id);
+      const un = document.getElementById("u_" + id + "N"), uu = document.getElementById("u_" + id + "U");
       const pd = partsToDur(pn.value, pu.value);
       const ld = partsToDur(ln.value, lu.value);
       const gd = gn && gn.value !== "" ? partsToDur(gn.value, gu.value) : null;
       if (pn.value !== "" && !pd) return { err: "patrol" };
       if (ln.value !== "" && !ld) return { err: "lead" };
       if (gn && gn.value !== "" && !gd) return { err: "guard" };
+      const ud = un && un.value !== "" ? partsToDur(un.value, uu.value) : null;
+      if (un && un.value !== "" && !ud) return { err: "usage" };
       const prevOv = (cfg.account_overrides || {})[id] || {};
       if (pn.value !== "" ) entry.refresh_interval = keepOrig(pd, prevOv.refresh_interval);
       if (ln.value !== "" ) entry.trigger_lead_time = keepOrig(ld, prevOv.trigger_lead_time);
@@ -1156,6 +1217,9 @@ func renderStatusHTML(state *PluginState) string {
       if (df && df.value === "on") entry.defer_reset_near_weekly_recovery = true;
       else if (df && df.value === "off") entry.defer_reset_near_weekly_recovery = false;
       if (gn && gn.value !== "" ) entry.weekly_recovery_guard_window = keepOrig(gd, prevOv.weekly_recovery_guard_window);
+      if (xs && xs.value === "on") entry.limit_weekly_reset_to_expiry_window = true;
+      else if (xs && xs.value === "off") entry.limit_weekly_reset_to_expiry_window = false;
+      if (un && un.value !== "" ) entry.credit_expiry_usage_window = keepOrig(ud, prevOv.credit_expiry_usage_window);
       if (Object.keys(entry).length) overrides[id] = entry;
       else delete overrides[id];
       return { overrides: overrides };
@@ -1165,13 +1229,16 @@ func renderStatusHTML(state *PluginState) string {
       const ss = document.getElementById("ss_" + id);
       const got = collectRow(id);
       const gwEl = document.getElementById("g_" + id + "N");
+      const uwEl = document.getElementById("u_" + id + "N");
       if (gwEl) gwEl.removeAttribute("aria-invalid");
+      if (uwEl) uwEl.removeAttribute("aria-invalid");
       if (got.err) {
         ss.className = "save-status err";
-        // Field-specific feedback: name the guard-window control and flag
-        // it aria-invalid so the error is distinguishable from patrol/lead.
-        ss.textContent = got.err === "guard" ? t("invalidGuardWindow") : t("invalidDuration");
+        // Field-specific feedback: name the window control and flag it
+        // aria-invalid so the error is distinguishable from patrol/lead.
+        ss.textContent = got.err === "guard" ? t("invalidGuardWindow") : got.err === "usage" ? t("invalidUsageWindow") : t("invalidDuration");
         if (got.err === "guard" && gwEl) gwEl.setAttribute("aria-invalid","true");
+        if (got.err === "usage" && uwEl) uwEl.setAttribute("aria-invalid","true");
         return;
       }
       const cfg = (state.status && state.status.config) || {};
@@ -1297,9 +1364,9 @@ func renderStatusHTML(state *PluginState) string {
       document.addEventListener("input", ev => {
         const el = ev.target;
         if (!(el instanceof Element) || !el.id) return;
-        if (["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU"].includes(el.id)) { globalDirty = true; return; }
-        // Row control ids: p_<id>N|U, l_<id>N|U, g_<id>N|U, w_<id>, d_<id>.
-        const m = /^[plg]_(.+)[NU]$/.exec(el.id) || /^[wd]_(.+)$/.exec(el.id);
+        if (["gRefreshN","gRefreshU","gLeadN","gLeadU","gWeekly","gDefer","gGuardN","gGuardU","gLimit","gUsageN","gUsageU"].includes(el.id)) { globalDirty = true; return; }
+        // Row control ids: p_|l_|g_|u_<id>N|U, w_|d_|x_<id>.
+        const m = /^[plgu]_(.+)[NU]$/.exec(el.id) || /^[wdx]_(.+)$/.exec(el.id);
         if (m) markRowDirty(m[1]);
       });
       bindDnD();

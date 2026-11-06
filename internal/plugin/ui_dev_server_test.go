@@ -20,8 +20,11 @@ package plugin
 //
 // Fixtures: 3 accounts — "acct-a" enabled with a lead-time override,
 // "acct-b" enabled inheriting, "acct-c" disabled; plus a persisted
-// target-consumed/recovery-pending reset record. The fake upstream never
-// contacts chatgpt.com.
+// target-consumed/recovery-pending reset record. "acct-a" has also been
+// stepped once against a fake upstream reporting exhausted weekly quota and a
+// credit expiring in 10 days, so its status and the Logs panel show the
+// credit-expiry usage-window deferral. The fake upstream never contacts
+// chatgpt.com.
 
 import (
 	"io"
@@ -66,7 +69,17 @@ func TestUIDevServer(t *testing.T) {
 			{AuthIndex: "acct-c", ID: "codex-cccc-carol@example.com.json", Name: "codex-cccc-carol@example.com.json"},
 		}, nil
 	}
-	// No worker: check/reset handlers get nil worker and respond safely.
+	// A never-started worker only collects logs; acct-a's FSM is stepped once
+	// so the page shows a real outside-usage-window deferral decision.
+	w := NewWorker(cfg, cfg.EnabledAccounts, nil, nil)
+	upstream := exhaustedClient(30*time.Hour, now, map[string]*Credit{
+		"RateLimitResetCredit_devreserved01": {ID: "RateLimitResetCredit_devreserved01", Status: "available", ExpiresAt: now.Add(10 * 24 * time.Hour)},
+	})
+	fsm := NewAccountFSM("acct-a", CodexCredentials{}, cfg, upstream, time.Now, w.makeLogFn("acct-a"))
+	for i := 0; i < 20 && !fsm.StepAndSettle().After(time.Now()); i++ {
+	}
+	state.Accounts["acct-a"] = AccountRuntime{AuthID: "acct-a", State: fsm.State(), NextWake: fsm.NextWake(), LastSnapshot: fsm.LastSnapshot()}
+	h.worker = w
 	serve := func(w http.ResponseWriter, r *http.Request, prefix string) {
 		path := r.URL.Path
 		if prefix != "" {

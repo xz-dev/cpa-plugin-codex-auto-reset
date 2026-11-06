@@ -15,11 +15,13 @@ import (
 // false for the boolean) is a real override that survives global changes.
 // Overrides are keyed by stable account identity (auth_index), not labels.
 type AccountOverride struct {
-	RefreshInterval           *time.Duration `yaml:"refresh_interval" json:"-"`
-	TriggerLeadTime           *time.Duration `yaml:"trigger_lead_time" json:"-"`
-	AutoResetOnWeeklyExhaust  *bool          `yaml:"auto_reset_on_weekly_exhaustion" json:"auto_reset_on_weekly_exhaustion,omitempty"`
-	DeferResetNearRecovery    *bool          `yaml:"defer_reset_near_weekly_recovery" json:"defer_reset_near_weekly_recovery,omitempty"`
-	WeeklyRecoveryGuardWindow *time.Duration `yaml:"weekly_recovery_guard_window" json:"weekly_recovery_guard_window,omitempty"`
+	RefreshInterval                *time.Duration `yaml:"refresh_interval" json:"-"`
+	TriggerLeadTime                *time.Duration `yaml:"trigger_lead_time" json:"-"`
+	AutoResetOnWeeklyExhaust       *bool          `yaml:"auto_reset_on_weekly_exhaustion" json:"auto_reset_on_weekly_exhaustion,omitempty"`
+	DeferResetNearRecovery         *bool          `yaml:"defer_reset_near_weekly_recovery" json:"defer_reset_near_weekly_recovery,omitempty"`
+	WeeklyRecoveryGuardWindow      *time.Duration `yaml:"weekly_recovery_guard_window" json:"weekly_recovery_guard_window,omitempty"`
+	LimitWeeklyResetToExpiryWindow *bool          `yaml:"limit_weekly_reset_to_expiry_window" json:"limit_weekly_reset_to_expiry_window,omitempty"`
+	CreditExpiryUsageWindow        *time.Duration `yaml:"credit_expiry_usage_window" json:"credit_expiry_usage_window,omitempty"`
 }
 
 // IsZero reports whether every field is unset (pure inheritance). Empty
@@ -27,18 +29,21 @@ type AccountOverride struct {
 func (o AccountOverride) IsZero() bool {
 	return o.RefreshInterval == nil && o.TriggerLeadTime == nil &&
 		o.AutoResetOnWeeklyExhaust == nil && o.DeferResetNearRecovery == nil &&
-		o.WeeklyRecoveryGuardWindow == nil
+		o.WeeklyRecoveryGuardWindow == nil && o.LimitWeeklyResetToExpiryWindow == nil &&
+		o.CreditExpiryUsageWindow == nil
 }
 
 // MarshalJSON renders duration overrides as strings and keeps nil fields
 // absent so "inherit" round-trips as absence, not a copied value.
 func (o AccountOverride) MarshalJSON() ([]byte, error) {
 	type alias struct {
-		RefreshInterval           *string `json:"refresh_interval,omitempty"`
-		TriggerLeadTime           *string `json:"trigger_lead_time,omitempty"`
-		AutoResetOnWeeklyExhaust  *bool   `json:"auto_reset_on_weekly_exhaustion,omitempty"`
-		DeferResetNearRecovery    *bool   `json:"defer_reset_near_weekly_recovery,omitempty"`
-		WeeklyRecoveryGuardWindow *string `json:"weekly_recovery_guard_window,omitempty"`
+		RefreshInterval                *string `json:"refresh_interval,omitempty"`
+		TriggerLeadTime                *string `json:"trigger_lead_time,omitempty"`
+		AutoResetOnWeeklyExhaust       *bool   `json:"auto_reset_on_weekly_exhaustion,omitempty"`
+		DeferResetNearRecovery         *bool   `json:"defer_reset_near_weekly_recovery,omitempty"`
+		WeeklyRecoveryGuardWindow      *string `json:"weekly_recovery_guard_window,omitempty"`
+		LimitWeeklyResetToExpiryWindow *bool   `json:"limit_weekly_reset_to_expiry_window,omitempty"`
+		CreditExpiryUsageWindow        *string `json:"credit_expiry_usage_window,omitempty"`
 	}
 	var a alias
 	if o.RefreshInterval != nil {
@@ -53,8 +58,13 @@ func (o AccountOverride) MarshalJSON() ([]byte, error) {
 		s := formatDuration(*o.WeeklyRecoveryGuardWindow)
 		a.WeeklyRecoveryGuardWindow = &s
 	}
+	if o.CreditExpiryUsageWindow != nil {
+		s := formatDuration(*o.CreditExpiryUsageWindow)
+		a.CreditExpiryUsageWindow = &s
+	}
 	a.AutoResetOnWeeklyExhaust = o.AutoResetOnWeeklyExhaust
 	a.DeferResetNearRecovery = o.DeferResetNearRecovery
+	a.LimitWeeklyResetToExpiryWindow = o.LimitWeeklyResetToExpiryWindow
 	return json.Marshal(a)
 }
 
@@ -63,11 +73,13 @@ func (o AccountOverride) MarshalJSON() ([]byte, error) {
 // pointer so it stays distinguishable from "absent".
 func (o *AccountOverride) UnmarshalJSON(raw []byte) error {
 	type alias struct {
-		RefreshInterval           json.RawMessage `json:"refresh_interval"`
-		TriggerLeadTime           json.RawMessage `json:"trigger_lead_time"`
-		AutoResetOnWeeklyExhaust  *bool           `json:"auto_reset_on_weekly_exhaustion"`
-		DeferResetNearRecovery    *bool           `json:"defer_reset_near_weekly_recovery"`
-		WeeklyRecoveryGuardWindow json.RawMessage `json:"weekly_recovery_guard_window"`
+		RefreshInterval                json.RawMessage `json:"refresh_interval"`
+		TriggerLeadTime                json.RawMessage `json:"trigger_lead_time"`
+		AutoResetOnWeeklyExhaust       *bool           `json:"auto_reset_on_weekly_exhaustion"`
+		DeferResetNearRecovery         *bool           `json:"defer_reset_near_weekly_recovery"`
+		WeeklyRecoveryGuardWindow      json.RawMessage `json:"weekly_recovery_guard_window"`
+		LimitWeeklyResetToExpiryWindow *bool           `json:"limit_weekly_reset_to_expiry_window"`
+		CreditExpiryUsageWindow        json.RawMessage `json:"credit_expiry_usage_window"`
 	}
 	var a alias
 	if err := json.Unmarshal(raw, &a); err != nil {
@@ -75,6 +87,16 @@ func (o *AccountOverride) UnmarshalJSON(raw []byte) error {
 	}
 	o.AutoResetOnWeeklyExhaust = a.AutoResetOnWeeklyExhaust
 	o.DeferResetNearRecovery = a.DeferResetNearRecovery
+	o.LimitWeeklyResetToExpiryWindow = a.LimitWeeklyResetToExpiryWindow
+	if len(bytes.TrimSpace(a.CreditExpiryUsageWindow)) > 0 {
+		d, err := parseDurationJSON(a.CreditExpiryUsageWindow)
+		if err != nil {
+			return fmt.Errorf("credit_expiry_usage_window: %w", err)
+		}
+		o.CreditExpiryUsageWindow = &d
+	} else {
+		o.CreditExpiryUsageWindow = nil
+	}
 	if len(bytes.TrimSpace(a.RefreshInterval)) > 0 {
 		d, err := parseDurationJSON(a.RefreshInterval)
 		if err != nil {
@@ -116,6 +138,11 @@ type EffectivePolicy struct {
 	// within WeeklyRecoveryGuardWindow. Credit-expiry triggers always win.
 	DeferResetNearRecovery    bool          `json:"defer_reset_near_weekly_recovery"`
 	WeeklyRecoveryGuardWindow time.Duration `json:"-"`
+	// LimitWeeklyResetToExpiryWindow reserves a credit from new automatic
+	// weekly-exhaustion redemption until it expires within
+	// CreditExpiryUsageWindow. Credit-expiry triggers always win.
+	LimitWeeklyResetToExpiryWindow bool          `json:"limit_weekly_reset_to_expiry_window"`
+	CreditExpiryUsageWindow        time.Duration `json:"-"`
 }
 
 // Config holds the user-tunable fields. The scheduling fields are editable
@@ -133,20 +160,27 @@ type Config struct {
 	// weekly-exhaustion redemption when the normal weekly window recovers
 	// within WeeklyRecoveryGuardWindow (default 24h, inclusive). Missing
 	// recovery time falls back to existing exhaustion redemption.
-	DeferResetNearRecovery    bool                       `yaml:"defer_reset_near_weekly_recovery" json:"defer_reset_near_weekly_recovery"`
-	WeeklyRecoveryGuardWindow time.Duration              `yaml:"weekly_recovery_guard_window" json:"-"`
-	AccountOverrides          map[string]AccountOverride `yaml:"account_overrides" json:"account_overrides,omitempty"`
+	DeferResetNearRecovery    bool          `yaml:"defer_reset_near_weekly_recovery" json:"defer_reset_near_weekly_recovery"`
+	WeeklyRecoveryGuardWindow time.Duration `yaml:"weekly_recovery_guard_window" json:"-"`
+	// LimitWeeklyResetToExpiryWindow (default true) allows weekly-exhaustion
+	// redemption only for a credit expiring within CreditExpiryUsageWindow
+	// (default 168h, inclusive). Expiry-trigger redemption is unaffected.
+	LimitWeeklyResetToExpiryWindow bool                       `yaml:"limit_weekly_reset_to_expiry_window" json:"limit_weekly_reset_to_expiry_window"`
+	CreditExpiryUsageWindow        time.Duration              `yaml:"credit_expiry_usage_window" json:"-"`
+	AccountOverrides               map[string]AccountOverride `yaml:"account_overrides" json:"account_overrides,omitempty"`
 }
 
 // EffectivePolicy resolves one account's policy field-by-field: a saved
 // override wins; an absent field inherits the global default.
 func (c Config) EffectivePolicy(authID string) EffectivePolicy {
 	p := EffectivePolicy{
-		RefreshInterval:           c.RefreshInterval,
-		TriggerLeadTime:           c.TriggerLeadTime,
-		AutoResetOnWeeklyExhaust:  c.AutoResetOnWeeklyExhaust,
-		DeferResetNearRecovery:    c.DeferResetNearRecovery,
-		WeeklyRecoveryGuardWindow: c.WeeklyRecoveryGuardWindow,
+		RefreshInterval:                c.RefreshInterval,
+		TriggerLeadTime:                c.TriggerLeadTime,
+		AutoResetOnWeeklyExhaust:       c.AutoResetOnWeeklyExhaust,
+		DeferResetNearRecovery:         c.DeferResetNearRecovery,
+		WeeklyRecoveryGuardWindow:      c.WeeklyRecoveryGuardWindow,
+		LimitWeeklyResetToExpiryWindow: c.LimitWeeklyResetToExpiryWindow,
+		CreditExpiryUsageWindow:        c.CreditExpiryUsageWindow,
 	}
 	if ov, ok := c.AccountOverrides[authID]; ok {
 		if ov.RefreshInterval != nil {
@@ -164,6 +198,12 @@ func (c Config) EffectivePolicy(authID string) EffectivePolicy {
 		if ov.WeeklyRecoveryGuardWindow != nil {
 			p.WeeklyRecoveryGuardWindow = *ov.WeeklyRecoveryGuardWindow
 		}
+		if ov.LimitWeeklyResetToExpiryWindow != nil {
+			p.LimitWeeklyResetToExpiryWindow = *ov.LimitWeeklyResetToExpiryWindow
+		}
+		if ov.CreditExpiryUsageWindow != nil {
+			p.CreditExpiryUsageWindow = *ov.CreditExpiryUsageWindow
+		}
 	}
 	return p
 }
@@ -173,24 +213,28 @@ func (c Config) EffectivePolicy(authID string) EffectivePolicy {
 // unreadable in the management UI's raw JSON view.
 func (c Config) MarshalJSON() ([]byte, error) {
 	type alias struct {
-		RefreshInterval           string                     `json:"refresh_interval"`
-		TriggerLeadTime           string                     `json:"trigger_lead_time"`
-		EnabledAccounts           []string                   `json:"enabled_accounts"`
-		StateDir                  string                     `json:"state_dir,omitempty"`
-		AutoResetOnWeeklyExhaust  bool                       `json:"auto_reset_on_weekly_exhaustion"`
-		DeferResetNearRecovery    bool                       `json:"defer_reset_near_weekly_recovery"`
-		WeeklyRecoveryGuardWindow string                     `json:"weekly_recovery_guard_window"`
-		AccountOverrides          map[string]AccountOverride `json:"account_overrides,omitempty"`
+		RefreshInterval                string                     `json:"refresh_interval"`
+		TriggerLeadTime                string                     `json:"trigger_lead_time"`
+		EnabledAccounts                []string                   `json:"enabled_accounts"`
+		StateDir                       string                     `json:"state_dir,omitempty"`
+		AutoResetOnWeeklyExhaust       bool                       `json:"auto_reset_on_weekly_exhaustion"`
+		DeferResetNearRecovery         bool                       `json:"defer_reset_near_weekly_recovery"`
+		WeeklyRecoveryGuardWindow      string                     `json:"weekly_recovery_guard_window"`
+		LimitWeeklyResetToExpiryWindow bool                       `json:"limit_weekly_reset_to_expiry_window"`
+		CreditExpiryUsageWindow        string                     `json:"credit_expiry_usage_window"`
+		AccountOverrides               map[string]AccountOverride `json:"account_overrides,omitempty"`
 	}
 	return json.Marshal(alias{
-		RefreshInterval:           formatDuration(c.RefreshInterval),
-		TriggerLeadTime:           formatDuration(c.TriggerLeadTime),
-		EnabledAccounts:           c.EnabledAccounts,
-		StateDir:                  c.StateDir,
-		AutoResetOnWeeklyExhaust:  c.AutoResetOnWeeklyExhaust,
-		DeferResetNearRecovery:    c.DeferResetNearRecovery,
-		WeeklyRecoveryGuardWindow: formatDuration(c.WeeklyRecoveryGuardWindow),
-		AccountOverrides:          c.AccountOverrides,
+		RefreshInterval:                formatDuration(c.RefreshInterval),
+		TriggerLeadTime:                formatDuration(c.TriggerLeadTime),
+		EnabledAccounts:                c.EnabledAccounts,
+		StateDir:                       c.StateDir,
+		AutoResetOnWeeklyExhaust:       c.AutoResetOnWeeklyExhaust,
+		DeferResetNearRecovery:         c.DeferResetNearRecovery,
+		WeeklyRecoveryGuardWindow:      formatDuration(c.WeeklyRecoveryGuardWindow),
+		LimitWeeklyResetToExpiryWindow: c.LimitWeeklyResetToExpiryWindow,
+		CreditExpiryUsageWindow:        formatDuration(c.CreditExpiryUsageWindow),
+		AccountOverrides:               c.AccountOverrides,
 	})
 }
 
@@ -210,18 +254,20 @@ func formatDuration(d time.Duration) string {
 
 // UnmarshalJSON accepts both the string form ("1h") and the raw nanosecond
 // integer form (3600000000000) for Duration fields, for round-trip safety.
-// Absent fields decode to zero, which normalizeConfig then repairs to the
-// fresh defaults — legacy saved values are never rewritten here.
+// Absent durations decode to zero for normalizeConfig to default; the usage
+// restriction defaults to true, while explicit false and legacy values survive.
 func (c *Config) UnmarshalJSON(raw []byte) error {
 	type alias struct {
-		RefreshInterval           json.RawMessage            `json:"refresh_interval"`
-		TriggerLeadTime           json.RawMessage            `json:"trigger_lead_time"`
-		EnabledAccounts           []string                   `json:"enabled_accounts"`
-		StateDir                  string                     `json:"state_dir"`
-		AutoResetOnWeeklyExhaust  *bool                      `json:"auto_reset_on_weekly_exhaustion"`
-		DeferResetNearRecovery    *bool                      `json:"defer_reset_near_weekly_recovery"`
-		WeeklyRecoveryGuardWindow json.RawMessage            `json:"weekly_recovery_guard_window"`
-		AccountOverrides          map[string]AccountOverride `json:"account_overrides"`
+		RefreshInterval                json.RawMessage            `json:"refresh_interval"`
+		TriggerLeadTime                json.RawMessage            `json:"trigger_lead_time"`
+		EnabledAccounts                []string                   `json:"enabled_accounts"`
+		StateDir                       string                     `json:"state_dir"`
+		AutoResetOnWeeklyExhaust       *bool                      `json:"auto_reset_on_weekly_exhaustion"`
+		DeferResetNearRecovery         *bool                      `json:"defer_reset_near_weekly_recovery"`
+		WeeklyRecoveryGuardWindow      json.RawMessage            `json:"weekly_recovery_guard_window"`
+		LimitWeeklyResetToExpiryWindow *bool                      `json:"limit_weekly_reset_to_expiry_window"`
+		CreditExpiryUsageWindow        json.RawMessage            `json:"credit_expiry_usage_window"`
+		AccountOverrides               map[string]AccountOverride `json:"account_overrides"`
 	}
 	var a alias
 	if err := json.Unmarshal(raw, &a); err != nil {
@@ -248,6 +294,17 @@ func (c *Config) UnmarshalJSON(raw []byte) error {
 		c.WeeklyRecoveryGuardWindow = d
 	} else {
 		c.WeeklyRecoveryGuardWindow = 0 // normalizeConfig defaults to 24h
+	}
+	// The usage restriction defaults ON when absent; an explicit false survives.
+	c.LimitWeeklyResetToExpiryWindow = a.LimitWeeklyResetToExpiryWindow == nil || *a.LimitWeeklyResetToExpiryWindow
+	if len(bytes.TrimSpace(a.CreditExpiryUsageWindow)) > 0 {
+		d, err := parseDurationJSON(a.CreditExpiryUsageWindow)
+		if err != nil {
+			return fmt.Errorf("credit_expiry_usage_window: %w", err)
+		}
+		c.CreditExpiryUsageWindow = d
+	} else {
+		c.CreditExpiryUsageWindow = 0 // normalizeConfig defaults to 168h
 	}
 	d1, err := parseDurationJSON(a.RefreshInterval)
 	if err != nil {
@@ -288,24 +345,32 @@ func parseDurationJSON(raw json.RawMessage) (time.Duration, error) {
 	return 0, fmt.Errorf("must be a duration string like \"1h\" or a nanosecond integer")
 }
 
-// DefaultConfig returns the spec defaults for a fresh install: 1h patrol,
-// 5m credit-expiry lead time, weekly-exhaustion redemption disabled, and no
+// DefaultConfig returns fresh defaults: 1h patrol, 5m credit-expiry lead,
+// weekly-exhaustion redemption and natural-recovery deferral off, a 24h recovery
+// guard, the credit-expiry usage restriction on with a 168h window, and no
 // accounts enabled (empty == soft-disable until the user opts accounts in).
 func DefaultConfig() Config {
 	return Config{
-		RefreshInterval:           time.Hour,
-		TriggerLeadTime:           5 * time.Minute,
-		EnabledAccounts:           nil,
-		AutoResetOnWeeklyExhaust:  false,
-		DeferResetNearRecovery:    false,
-		WeeklyRecoveryGuardWindow: 24 * time.Hour,
+		RefreshInterval:                time.Hour,
+		TriggerLeadTime:                5 * time.Minute,
+		EnabledAccounts:                nil,
+		AutoResetOnWeeklyExhaust:       false,
+		DeferResetNearRecovery:         false,
+		WeeklyRecoveryGuardWindow:      24 * time.Hour,
+		LimitWeeklyResetToExpiryWindow: true,
+		CreditExpiryUsageWindow:        DefaultCreditExpiryUsageWindow,
 	}
 }
+
+// DefaultCreditExpiryUsageWindow is 7 elapsed days.
+const DefaultCreditExpiryUsageWindow = 168 * time.Hour
 
 // parseConfigYAML parses user YAML and normalizes it. Malformed YAML returns
 // an error; missing fields fall back to defaults via normalizeConfig.
 func parseConfigYAML(raw []byte) (Config, error) {
-	var cfg Config
+	// Seed defaults so an omitted default-true switch stays true while an
+	// explicit false survives decoding.
+	cfg := DefaultConfig()
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config yaml: %w", err)
 	}
@@ -327,6 +392,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.WeeklyRecoveryGuardWindow < time.Minute {
 		cfg.WeeklyRecoveryGuardWindow = 24 * time.Hour
+	}
+	if cfg.CreditExpiryUsageWindow < time.Minute {
+		cfg.CreditExpiryUsageWindow = DefaultCreditExpiryUsageWindow
 	}
 	out := make([]string, 0, len(cfg.EnabledAccounts))
 	seen := map[string]bool{}
@@ -358,6 +426,10 @@ func normalizeConfig(cfg Config) Config {
 				v := time.Minute
 				ov.WeeklyRecoveryGuardWindow = &v
 			}
+			if ov.CreditExpiryUsageWindow != nil && *ov.CreditExpiryUsageWindow < time.Minute {
+				v := time.Minute
+				ov.CreditExpiryUsageWindow = &v
+			}
 			if ov.IsZero() {
 				continue
 			}
@@ -384,6 +456,9 @@ func validateSettings(cfg Config) error {
 	if cfg.WeeklyRecoveryGuardWindow < time.Minute {
 		return fmt.Errorf("weekly_recovery_guard_window must be at least 1m")
 	}
+	if cfg.CreditExpiryUsageWindow < time.Minute {
+		return fmt.Errorf("credit_expiry_usage_window must be at least 1m")
+	}
 	for id, ov := range cfg.AccountOverrides {
 		if ov.RefreshInterval != nil && *ov.RefreshInterval < time.Minute {
 			return fmt.Errorf("account %s: refresh_interval must be at least 1m", id)
@@ -393,6 +468,9 @@ func validateSettings(cfg Config) error {
 		}
 		if ov.WeeklyRecoveryGuardWindow != nil && *ov.WeeklyRecoveryGuardWindow < time.Minute {
 			return fmt.Errorf("account %s: weekly_recovery_guard_window must be at least 1m", id)
+		}
+		if ov.CreditExpiryUsageWindow != nil && *ov.CreditExpiryUsageWindow < time.Minute {
+			return fmt.Errorf("account %s: credit_expiry_usage_window must be at least 1m", id)
 		}
 	}
 	return nil
