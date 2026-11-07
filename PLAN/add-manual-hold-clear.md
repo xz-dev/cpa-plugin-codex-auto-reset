@@ -1,6 +1,6 @@
 # add-manual-hold-clear — implementation plan
 
-Source of truth: `openspec/changes/add-manual-hold-clear/` (proposal, design,
+Source of truth: `openspec/changes/archive/2026-11-07-add-manual-hold-clear/` (proposal, design,
 specs, tasks). Branch `feat/manual-hold-clear` from main `81cde49`.
 
 ## Checkpoints
