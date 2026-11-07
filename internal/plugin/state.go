@@ -44,7 +44,9 @@ func saveState(path string, s *PluginState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(s, "", "  ")
+	snapshot := *s
+	snapshot.Logs = redactLogEntries(s.Logs)
+	raw, err := json.MarshalIndent(&snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -53,6 +55,25 @@ func saveState(path string, s *PluginState) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// normalBackupBytes sanitizes only diagnostic logs, retaining every other
+// raw JSON field (including fields unknown to this binary). Corrupt forensic
+// originals do not pass through this normal-backup projection.
+func normalBackupBytes(raw []byte, logs []LogEntry) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if _, ok := fields["logs"]; !ok {
+		return raw, nil
+	}
+	safe, err := json.Marshal(redactLogEntries(logs))
+	if err != nil {
+		return nil, err
+	}
+	fields["logs"] = safe
+	return json.MarshalIndent(fields, "", "  ")
 }
 
 // stateReadRetries/readRetryDelay tolerate transient read locks (Windows AV
@@ -69,8 +90,8 @@ const (
 //  1. main file missing            → try <path>.bak → else fresh-empty
 //  2. main file unparseable        → quarantine the raw bytes next to it as
 //     <path>.corrupt-<ts> (never destroyed silently) → try .bak → else fresh
-//  3. main file readable + valid   → refresh <path>.bak from the same bytes
-//     so the next boot has a one-generation fallback
+//  3. main file readable + valid   → refresh <path>.bak with sanitized logs,
+//     retaining other JSON fields as a one-generation fallback
 //
 // A missing file is first-run behavior, not an error. Transient read errors
 // are retried; anything else after the retries returns an error (the caller
@@ -85,7 +106,9 @@ func loadState(path string) (*PluginState, string, error) {
 	}
 	st, parseErr := parseState(raw)
 	if parseErr == nil {
-		_ = os.WriteFile(path+".bak", raw, 0o600) // best-effort backup refresh
+		if backup, backupErr := normalBackupBytes(raw, st.Logs); backupErr == nil {
+			_ = os.WriteFile(path+".bak", backup, 0o600) // best-effort sanitized normal backup
+		}
 		return st, "main", nil
 	}
 	// Corrupt main: preserve the bytes for manual inspection before any
@@ -138,6 +161,8 @@ func parseState(raw []byte) (*PluginState, error) {
 	if s.Accounts == nil {
 		s.Accounts = map[string]AccountRuntime{}
 	}
+	s.Logs = redactLogEntries(s.Logs)
+	markLegacyDiagnostics(&s)
 	return &s, nil
 }
 

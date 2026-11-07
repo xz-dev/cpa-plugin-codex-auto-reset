@@ -130,6 +130,9 @@ type ResetAttempt struct {
 	HoldChecks  int       `json:"hold_checks,omitempty"`
 	HoldCheckAt time.Time `json:"hold_check_at,omitempty"`
 	HoldCount   int       `json:"hold_count,omitempty"`
+	// Diag is the bounded causal summary of this attempt (nil = legacy,
+	// evidence unavailable). Always deep-copied across goroutines.
+	Diag *AttemptDiag `json:"diag,omitempty"`
 }
 
 // LogEntry is one audit-trail record (spec §8.1). Every state transition and
@@ -160,14 +163,22 @@ type ResetRecord struct {
 	// RecoveryConfirmed records known weekly-quota recovery separately from
 	// overall Success (which also needs consumption and the count check).
 	RecoveryConfirmed bool `json:"recovery_confirmed,omitempty"`
-	// ResolvesEarlier marks a read-only recovery that upgrades the earlier
-	// record for the same credit instead of adding a new one. Not persisted.
+	// ResolvesEarlier upgrades a prior record by account/request identity;
+	// legacy records without identity require a unique account/credit match.
+	// Not persisted.
 	ResolvesEarlier bool        `json:"-"`
 	CycleReason     CycleReason `json:"cycle_reason,omitempty"`
 	PreWeeklyPct    int         `json:"pre_weekly_pct"`
 	PostWeeklyPct   int         `json:"post_weekly_pct"`
 	PreCredits      int         `json:"pre_credits"`
 	PostCredits     int         `json:"post_credits"`
+	// RedeemRequestID identifies the attempt exactly; history updates for
+	// the same attempt upsert by (AuthID, RedeemRequestID). Empty on legacy
+	// records, which are never guessed into a newer attempt.
+	RedeemRequestID string `json:"redeem_request_id,omitempty"`
+	// Diag is the attempt's diagnostic summary at record time (legacy
+	// records carry a LegacyUnavailable marker after load).
+	Diag *AttemptDiag `json:"diag,omitempty"`
 }
 
 // availableCreditsSorted implements spec §2.3: filter to status=="available"

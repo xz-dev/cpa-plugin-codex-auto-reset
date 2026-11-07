@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -66,6 +67,15 @@ type AccountFSM struct {
 	// Called with mu held; it must not call back into the FSM. An error blocks
 	// spending for this cycle.
 	PersistAttempt func(a ResetAttempt) error
+	// Checkpoint, when non-nil, synchronously persists an attempt snapshot
+	// under a phase (dispatch intent before each consume). Called with mu
+	// held; must not call back into the FSM. Failure is logged and never
+	// changes spending or retry behavior.
+	Checkpoint func(phase State, a ResetAttempt) error
+	// postDispatch marks that VERIFYING was entered from a consume response
+	// in this process, so its observation is "post_dispatch" rather than a
+	// read-only "reverify" (patrol or restart).
+	postDispatch bool
 	// testPostStep, when non-nil, runs inside StepAndSettle after the tick
 	// but BEFORE the settle decision, with mu still held. Tests use it to
 	// prove that a concurrent ForceConfirm/TriggerCheck cannot interleave
@@ -119,7 +129,7 @@ func (f *AccountFSM) LastSnapshot() Snapshot {
 func (f *AccountFSM) Attempt() ResetAttempt {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.attempt
+	return f.attempt.clone()
 }
 
 // RestoreAttempt re-seeds a persisted attempt after restart so an uncertain
@@ -128,16 +138,31 @@ func (f *AccountFSM) Attempt() ResetAttempt {
 func (f *AccountFSM) RestoreAttempt(a ResetAttempt) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if a.RedeemRequestID != "" {
+	retired := !f.autoHold && a.Diag != nil && a.Diag.OperatorClear != nil
+	// Held legacy attempts can lack an identity but still own positive evidence.
+	if a.RedeemRequestID != "" || retired || f.autoHold {
+		a = a.clone()
 		// Hold-release progress never survives a restart: a write that
 		// invalidated it may have failed, so start the streak over.
 		a.HoldChecks, a.HoldCheckAt, a.HoldCount = 0, time.Time{}, 0
+		if a.Diag == nil {
+			a.Diag = legacyDiag() // saved before diagnostics: evidence unavailable
+		}
+		for i := range a.Diag.Dispatches {
+			if a.Diag.Dispatches[i].Delivery == deliveryPending {
+				// The process stopped between intent and outcome: the
+				// request may or may not have reached upstream.
+				a.Diag.Dispatches[i].Delivery = deliveryUnknown
+				a.Diag.Dispatches[i].ErrorKind = "process_stopped"
+			}
+		}
 		f.attempt = a
 		// An in-flight (never classified) or explicitly unresolved attempt is
 		// reconciled read-only through verification instead of letting
 		// CONFIRMING mint a new key. A classified held attempt stays IDLE
-		// under its hold. Call after SetAutoHold.
-		if a.Reverify || !f.autoHold {
+		// under its hold. Explicitly cleared evidence is retired, not a new
+		// verification request. Call after SetAutoHold.
+		if !retired && (a.Reverify || !f.autoHold) {
 			f.state = StateVERIFYING
 			f.verifyDue = f.now()
 		}
@@ -211,6 +236,137 @@ func (f *AccountFSM) BreakHoldStreak() {
 func (f *AccountFSM) holdUnresolved() {
 	f.setHold(false)
 	f.attempt.Reverify = true
+}
+
+// diag returns the current attempt's diagnostics, labeling an attempt that
+// has none as legacy (evidence unavailable). Caller holds mu.
+func (f *AccountFSM) diag() *AttemptDiag {
+	if f.attempt.Diag == nil {
+		f.attempt.Diag = legacyDiag()
+	}
+	return f.attempt.Diag
+}
+
+// corr returns structured log details correlated to the current attempt.
+func (f *AccountFSM) corr(extra map[string]any) map[string]any {
+	m := map[string]any{
+		"redeem_request_id": f.attempt.RedeemRequestID,
+		"credit_id":         f.attempt.TargetCreditID,
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	return m
+}
+
+// noteHold records why this attempt entered the hold. Only the first cause
+// is kept as the original; a later re-hold of the same attempt becomes the
+// latest observation. Call after setHold/holdUnresolved. Caller holds mu.
+func (f *AccountFSM) noteHold(now time.Time, cause, detail string) {
+	d := f.diag()
+	if d.Hold == nil {
+		d.Hold = &HoldDiag{Cause: cause, Detail: detail, Since: now}
+		if d.LegacyUnavailable {
+			// A legacy attempt may already have been held for an unknown
+			// reason; this is the first cause observed with diagnostics.
+			d.Hold.Since = time.Time{}
+			d.Hold.OriginalUnavailable = true
+		}
+	} else {
+		f.observeHold(now, cause, detail, time.Time{})
+	}
+	d.Hold.RecoveryOnly = f.holdRecoveryOnly
+	d.Seq++
+}
+
+// observeHold records the latest continued-hold reason, coalescing repeats
+// of the same reason into a counter so storage stays bounded. Caller holds mu.
+func (f *AccountFSM) observeHold(now time.Time, reason, detail string, next time.Time) {
+	d := f.diag()
+	if d.Hold == nil {
+		d.Hold = &HoldDiag{Cause: "unavailable", OriginalUnavailable: true}
+	}
+	l := d.Hold.Latest
+	if l != nil && l.Reason == reason {
+		l.Repeats++
+		l.At, l.Detail = now, detail
+	} else {
+		l = &HoldObservation{Reason: reason, Detail: detail, FirstAt: now, At: now, Repeats: 1}
+		d.Hold.Latest = l
+	}
+	l.StableChecks, l.NextCheckAt = f.attempt.HoldChecks, next
+}
+
+// holdBlock names the rule that kept a held patrol from releasing. Call
+// after stableHoldCheck (it reads the updated streak). Caller holds mu.
+func (f *AccountFSM) holdBlock(usageErr error, usage, raw Snapshot) (string, string) {
+	a := f.attempt
+	if f.holdRecoveryOnly {
+		switch {
+		case usageErr != nil:
+			return "usage_read_failed", "weekly usage query failed (" + errKind(usageErr) + "); recovery cannot be judged"
+		case !usage.WeeklyKnown:
+			return "weekly_unknown", "normal weekly usage unknown; recovery cannot be judged"
+		}
+		return "recovery_pending", fmt.Sprintf("weekly %d%% remaining (used %.1f%%), not above pre-reset %d%%",
+			usage.WeeklyPct, usage.WeeklyUsedPct, a.PreSnapshot.WeeklyPct)
+	}
+	for _, c := range raw.Credits {
+		if c.InFlight() {
+			return "redemption_in_flight", "credit " + shortID(c.ID) + " shows a redemption in flight"
+		}
+	}
+	switch {
+	case usageErr != nil:
+		return "usage_read_failed", "weekly usage query failed (" + errKind(usageErr) + "); stable-check release requires known usage"
+	case !usage.WeeklyKnown:
+		return "weekly_unknown", "normal weekly usage unknown; stable-check release requires known non-exhausted usage"
+	case usage.WeeklyExhausted():
+		return "weekly_exhausted", fmt.Sprintf("normal weekly usage %.1f%% (exhausted); stable-check release requires non-exhausted usage",
+			usage.WeeklyUsedPct)
+	case f.holdPrior > 0 && raw.AvailableCount != a.HoldCount:
+		return "count_changed", fmt.Sprintf("available count %d differs from %d at the first stable check", raw.AvailableCount, a.HoldCount)
+	case f.holdPrior > 0 && a.HoldChecks == f.holdPrior:
+		return "spacing_not_reached", fmt.Sprintf("stable, but not more than %s after the last counted check", formatDuration(holdCheckMinGap))
+	}
+	return "stable_check_counted", fmt.Sprintf("stable check %d/%d counted", a.HoldChecks, holdStableChecks)
+}
+
+// recordDispatch fills the last dispatch observation from the client
+// result. Missing metadata stays explicitly unavailable; delivery is only
+// "response_received" when an HTTP response (or parsed reply) came back.
+func recordDispatch(dd *DispatchDiag, resp ConsumeResponse, err error) {
+	m := resp.Meta
+	if m == (ResponseMeta{}) {
+		dd.MetaUnavailable = true
+		dd.ErrorKind = errKind(err)
+		var he *HTTPStatusError
+		switch {
+		case errors.As(err, &he):
+			dd.Delivery, dd.HTTPStatus = deliveryReceived, he.Code
+		case err != nil:
+			dd.Delivery = deliveryUnknown
+		default:
+			dd.Delivery = deliveryUnknown // client result alone is not HTTP delivery evidence
+		}
+	} else {
+		dd.HTTPStatus, dd.ErrorKind, dd.ElapsedMs = m.HTTPStatus, safeErrorKind(m.ErrorKind), m.Elapsed.Milliseconds()
+		switch {
+		case m.HTTPStatus > 0:
+			dd.Delivery = deliveryReceived
+		case !m.Sent && m.ErrorKind == "request_invalid":
+			dd.Delivery = deliveryNotSent
+		default:
+			dd.Delivery = deliveryUnknown
+		}
+	}
+	if err == nil {
+		dd.APICode = safeToken(string(resp.Code))
+		if resp.HasWindowsReset || resp.WindowsReset != 0 {
+			w := resp.WindowsReset
+			dd.WindowsReset = &w
+		}
+	}
 }
 
 // AutoHold reports whether the automatic-spending hold is active.
@@ -369,6 +525,9 @@ func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, detai
 
 func (f *AccountFSM) stepIDLE() time.Time {
 	now := f.now()
+	if f.autoHold && strings.TrimSpace(f.attempt.TargetCreditID) == "" {
+		return f.stepVERIFYING() // unidentified holds cannot earn automatic release
+	}
 	// One raw read per patrol; the available view is derived locally so a
 	// held account's reconciliation sees every row (e.g. in-flight ones).
 	snap, err := f.Client.ListAllCredits(f.Creds)
@@ -377,7 +536,14 @@ func (f *AccountFSM) stepIDLE() time.Time {
 	if err != nil {
 		next := now.Add(f.eff().RefreshInterval)
 		f.nextWake = next
-		f.log("warn", fmt.Sprintf("list failed: %v", err), "retry patrol", &next, nil)
+		var details map[string]any
+		if f.autoHold {
+			why := "credit list failed (" + errKind(err) + "); stable-check streak restarts"
+			f.observeHold(now, "list_read_failed", why, next)
+			details = f.corr(map[string]any{"phase": "hold_continued", "block_reason": "list_read_failed",
+				"hold_cause": f.diag().Hold.Cause})
+		}
+		f.log("warn", fmt.Sprintf("list failed: %v", safeDiagnosticError(err)), "retry patrol", &next, details)
 		return next
 	}
 	f.lastSnapshot = snap // mirror into the UI-facing snapshot
@@ -396,8 +562,9 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		// verification of that same attempt; never start a new cycle.
 		f.state = StateVERIFYING
 		f.nextWake = now
-		f.log("warn", "re-verifying unresolved reset attempt (read-only)", "verify", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "credit_id": f.attempt.TargetCreditID})
+		f.postDispatch = false
+		f.log("warn", "re-verifying unresolved reset attempt (read-only, no consume)", "verify", nil,
+			f.corr(map[string]any{"phase": "reverify"}))
 		return now
 	}
 	if f.autoHold {
@@ -420,13 +587,33 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		if !released {
 			next := now.Add(f.eff().RefreshInterval)
 			f.nextWake = next
-			f.log("warn", "automatic spending held: previous reset outcome unresolved", "patrol only (hold)", &next,
-				map[string]any{"stable_checks": f.attempt.HoldChecks})
+			reason, detail := f.holdBlock(usageErr, usage, raw)
+			f.observeHold(now, reason, detail, next)
+			h := f.diag().Hold
+			f.log("warn",
+				fmt.Sprintf("automatic spending held (cause=%s): %s; stable checks %d/%d; next read-only check %s",
+					h.Cause, detail, f.attempt.HoldChecks, holdStableChecks, next.Format("15:04:05")),
+				"patrol only (hold)", &next,
+				f.corr(map[string]any{
+					"phase":           "hold_continued",
+					"stable_checks":   f.attempt.HoldChecks,
+					"block_reason":    reason,
+					"hold_cause":      h.Cause,
+					"hold_since":      h.Since,
+					"repeats":         h.Latest.Repeats,
+					"available_count": raw.AvailableCount,
+					"weekly_known":    usageErr == nil && usage.WeeklyKnown,
+					"weekly_used_pct": usage.WeeklyUsedPct,
+				}))
 			return next
 		}
+		f.observeHold(now, "released", why, time.Time{})
+		f.diag().Seq++
+		releaseDetails := f.corr(map[string]any{"phase": "hold_released", "hold_cause": f.diag().Hold.Cause})
 		if f.holdRecoveryOnly && f.attempt.RedeemRequestID != "" {
 			// Upgrade the earlier "recovery pending" history record in place.
 			f.pendingHistory = &ResetRecord{
+				RedeemRequestID: f.attempt.RedeemRequestID, Diag: f.attempt.Diag.clone(),
 				Timestamp: now, AuthID: f.AuthID, CreditID: f.attempt.TargetCreditID,
 				Success: true, ConsumptionConfirmed: true, RecoveryConfirmed: true,
 				CycleReason: f.attempt.CycleReason, PreWeeklyPct: f.attempt.PreSnapshot.WeeklyPct,
@@ -436,7 +623,7 @@ func (f *AccountFSM) stepIDLE() time.Time {
 		}
 		f.autoHold, f.holdRecoveryOnly = false, false
 		f.attempt = ResetAttempt{}
-		f.log("info", "automatic-spending hold resolved: "+why, "patrol", nil, nil)
+		f.log("info", "automatic-spending hold resolved: "+why, "patrol", nil, releaseDetails)
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
 	if len(avail) == 0 {
@@ -507,7 +694,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 	snap, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
 		f.state = StateDONE
-		f.log("error", fmt.Sprintf("confirm list failed: %v", err), "abandon", nil, nil)
+		f.log("error", fmt.Sprintf("confirm list failed: %v", safeDiagnosticError(err)), "abandon", nil, nil)
 		return time.Time{}
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
@@ -540,7 +727,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 	usage, usageErr := f.Client.GetUsage(f.Creds)
 	if usageErr != nil && !f.manualReset && weeklyHint {
 		f.state = StateDONE
-		f.log("warn", fmt.Sprintf("weekly-exhaustion wake but usage check failed: %v", usageErr), "abandon", nil, nil)
+		f.log("warn", fmt.Sprintf("weekly-exhaustion wake but usage check failed: %v", safeDiagnosticError(usageErr)), "abandon", nil, nil)
 		return time.Time{}
 	}
 	if usageErr == nil {
@@ -632,7 +819,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 	}
 	if usageErr != nil {
 		f.state = StateDONE
-		f.log("error", fmt.Sprintf("confirm usage failed: %v", usageErr), "abandon", nil, nil)
+		f.log("error", fmt.Sprintf("confirm usage failed: %v", safeDiagnosticError(usageErr)), "abandon", nil, nil)
 		return time.Time{}
 	}
 	f.attempt = ResetAttempt{
@@ -647,10 +834,19 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		// between always re-verifies, whatever hold the account inherited.
 		Reverify: true,
 	}
+	pol := f.eff()
+	f.attempt.Diag = &AttemptDiag{Version: attemptDiagVersion, Seq: 1, Authorization: &AuthorizationDiag{
+		At: now, Reason: reason, TargetExpiresAt: target.ExpiresAt,
+		PreAvailable: snap.AvailableCount, PreWeeklyKnown: snap.WeeklyKnown,
+		PreWeeklyUsedPct: snap.WeeklyUsedPct, PreWeeklyResetAt: snap.WeeklyResetAt,
+		AutoWeeklyExhaust: pol.AutoResetOnWeeklyExhaust, DeferNearRecovery: pol.DeferResetNearRecovery,
+		RecoveryGuard: formatDuration(pol.WeeklyRecoveryGuardWindow), LimitToExpiryWin: pol.LimitWeeklyResetToExpiryWindow,
+		ExpiryUsageWindow: formatDuration(pol.CreditExpiryUsageWindow), TriggerLead: formatDuration(pol.TriggerLeadTime),
+	}}
 	// The attempt identity must be durable before any consume can land, so a
 	// crash can only ever reconcile this attempt, never start another one.
 	if f.PersistAttempt != nil {
-		if err := f.PersistAttempt(f.attempt); err != nil {
+		if err := f.PersistAttempt(f.attempt.clone()); err != nil {
 			f.attempt = ResetAttempt{}
 			f.state = StateDONE
 			f.log("error", fmt.Sprintf("cannot persist reset attempt, not spending: %v", err), "abandon", nil, nil)
@@ -670,6 +866,8 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			"pre_weekly_used_pct": snap.WeeklyUsedPct,
 			"target_expires_at":   target.ExpiresAt,
 			"redeem_request_id":   f.attempt.RedeemRequestID,
+			"phase":               "authorized",
+			"pre_weekly_known":    snap.WeeklyKnown,
 		})
 	return f.now()
 }
@@ -745,67 +943,133 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 	// fresh post-consume list check rather than firing another request.
 	if !f.attempt.TargetExpiresAt.IsZero() && !now.Before(f.attempt.TargetExpiresAt) {
 		f.state = StateDONE
+		details := f.corr(map[string]any{"phase": "dispatch_skipped", "invocations": f.attempt.Attempt})
 		if f.attempt.Attempt > 0 {
 			f.holdUnresolved() // an earlier consume's outcome is unknown
+			f.noteHold(now, "target_expired_after_dispatch",
+				fmt.Sprintf("target expired before invocation %d; an earlier invocation's outcome is unknown", f.attempt.Attempt+1))
+			details["hold_cause"] = "target_expired_after_dispatch"
 		} else {
 			defer func() { f.attempt = ResetAttempt{} }() // nothing was sent
 		}
 		f.log("warn",
 			fmt.Sprintf("target %s expired at %s before consume attempt %d; reconciling read-only, no substitute",
 				shortID(f.attempt.TargetCreditID), f.attempt.TargetExpiresAt.Format("15:04:05"), f.attempt.Attempt+1),
-			"abandon", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "credit_id": f.attempt.TargetCreditID})
+			"abandon", nil, details)
 		return time.Time{}
 	}
+	// Dispatch intent is recorded (and checkpointed) BEFORE the call. It is
+	// intent only: delivery stays unknown until a response comes back.
+	idx := f.attempt.Attempt
+	d := f.diag()
+	d.Dispatches = append(d.Dispatches, DispatchDiag{Index: idx, IntentAt: now, Delivery: deliveryPending})
+	d.Seq++
+	f.log("info",
+		fmt.Sprintf("dispatching reset request (invocation index %d, same idempotency key); intent only, delivery not yet known", idx),
+		"await response", nil, f.corr(map[string]any{"phase": "dispatch_intent", "dispatch_index": idx}))
+	if f.Checkpoint != nil {
+		if err := f.Checkpoint(StateRESETTING, f.attempt.clone()); err != nil {
+			f.log("warn", fmt.Sprintf("could not persist dispatch intent: %v", err), "send with durable attempt identity", nil,
+				f.corr(map[string]any{"phase": "dispatch_intent", "dispatch_index": idx}))
+		}
+	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
+	dd := &d.Dispatches[len(d.Dispatches)-1]
+	recordDispatch(dd, resp, err)
+	d.Seq++
+	resDetails := func(extra map[string]any) map[string]any {
+		m := f.corr(map[string]any{
+			"phase":          "dispatch_result",
+			"dispatch_index": idx,
+			"delivery":       dd.Delivery,
+			"http_status":    dd.HTTPStatus,
+			"api_code":       dd.APICode,
+			"error_kind":     dd.ErrorKind,
+			"elapsed_ms":     dd.ElapsedMs,
+		})
+		if dd.MetaUnavailable {
+			m["meta_unavailable"] = true
+		}
+		if dd.WindowsReset != nil {
+			m["windows_reset"] = *dd.WindowsReset
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
 	switch classifyConsume(resp, err) {
 	case decisionSuccess:
+		dd.Decision = "verify"
 		f.state = StateVERIFYING
+		f.postDispatch = true
 		f.verifyDue = now.Add(postResetVerifyDelay)
 		f.nextWake = f.verifyDue
+		windows, transport := "unavailable", ""
+		if dd.WindowsReset != nil {
+			windows = fmt.Sprint(*dd.WindowsReset)
+		}
+		if dd.MetaUnavailable {
+			transport = ", transport metadata unavailable"
+		}
 		f.log("info",
-			fmt.Sprintf("reset request accepted (code=%s, windows_reset=%d); will verify in %v",
-				resp.Code, resp.WindowsReset, postResetVerifyDelay),
+			fmt.Sprintf("consume client reported result (code=%s, delivery=%s, windows_reset=%s%s); will verify in %v",
+				dd.APICode, dd.Delivery, windows, transport, postResetVerifyDelay),
 			fmt.Sprintf("verify in %v", postResetVerifyDelay), &f.verifyDue,
-			map[string]any{
-				"redeem_request_id": f.attempt.RedeemRequestID,
-				"credit_id":         f.attempt.TargetCreditID,
-				"consume_code":      resp.Code,
-				"windows_reset":     resp.WindowsReset,
-			})
+			resDetails(map[string]any{
+				"consume_code": dd.APICode,
+				"decision":     "verify",
+			}))
 		return f.verifyDue
 	case decisionStop:
 		f.state = StateDONE
-		msg := fmt.Sprintf("reset stopped: server returned %s", resp.Code)
+		msg := fmt.Sprintf("reset stopped: server returned %s", safeToken(string(resp.Code)))
 		if err != nil {
-			msg = fmt.Sprintf("reset stopped: %v", err)
+			msg = fmt.Sprintf("reset stopped: %v", safeDiagnosticError(err))
 		}
 		knownCode := err == nil && (resp.Code == ConsumeCodeNoCredit || resp.Code == ConsumeCodeNothingToReset)
+		details := resDetails(nil)
 		if f.attempt.Attempt == 0 && (err != nil || knownCode) {
+			dd.Decision = "stop"
+			details["decision"] = "stop"
 			f.attempt = ResetAttempt{} // the only request was refused: nothing spent
 		} else {
+			dd.Decision = "stop_hold"
 			f.holdUnresolved() // unknown response, or an earlier attempt may have landed
+			why := "unrecognized response code"
+			if idx > 0 {
+				why = "an earlier invocation may have landed"
+			}
+			f.noteHold(now, "consume_outcome_unknown",
+				fmt.Sprintf("invocation %d stopped (delivery=%s, http=%d, code=%s, error=%s); %s",
+					idx, dd.Delivery, dd.HTTPStatus, dd.APICode, dd.ErrorKind, why))
+			details["decision"], details["hold_cause"] = "stop_hold", "consume_outcome_unknown"
 		}
-		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+		f.log("warn", msg, "abandon", nil, details)
 		return time.Time{}
 	case decisionRetry:
 		f.attempt.Attempt++
 		if f.attempt.Attempt > len(resetRetryDelays) {
+			dd.Decision = "retries_exhausted"
 			f.state = StateDONE
 			f.holdUnresolved() // a timed-out consume may still have landed
+			f.noteHold(now, "retries_exhausted",
+				fmt.Sprintf("%d invocations without a classifiable response (last delivery=%s, error=%s); any may have landed",
+					f.attempt.Attempt, dd.Delivery, dd.ErrorKind))
 			f.log("error",
-				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
+				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, safeDiagnosticError(err)),
 				"abandon", nil,
-				map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
+				resDetails(map[string]any{"decision": "retries_exhausted", "hold_cause": "retries_exhausted"}))
 			return time.Time{}
 		}
 		backoff := backoffForAttempt(f.attempt.Attempt)
 		f.attempt.NextRetryAt = now.Add(backoff)
 		f.nextWake = f.attempt.NextRetryAt
+		dd.Decision, dd.NextRetryAt = "retry", f.attempt.NextRetryAt
 		f.log("warn",
-			fmt.Sprintf("reset failed (attempt %d): %v; retrying with same idempotency key", f.attempt.Attempt, err),
+			fmt.Sprintf("reset failed (attempt %d): %v; retrying with same idempotency key (delivery %s)", f.attempt.Attempt, safeDiagnosticError(err), dd.Delivery),
 			fmt.Sprintf("retry in %v", backoff), &f.attempt.NextRetryAt,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "attempt": f.attempt.Attempt})
+			resDetails(map[string]any{"attempt": f.attempt.Attempt, "decision": "retry", "retry_in": backoff.String()}))
 		return f.attempt.NextRetryAt
 	}
 	return time.Time{}
@@ -820,12 +1084,50 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	// unknown, never an empty list. Absence explainable by expiry alone
 	// (target expiry already passed at verification time) is not claimed as
 	// consumption.
-	credits, err := f.Client.ListAllCredits(f.Creds)
-	if err != nil {
+	kind := "reverify" // read-only reconciliation (patrol or restart)
+	if f.postDispatch {
+		kind = "post_dispatch"
+	}
+	f.postDispatch = false
+	if strings.TrimSpace(f.attempt.TargetCreditID) == "" {
+		// An empty legacy target is not a row whose absence can prove use.
+		// Keep prior positive evidence, but make no new outcome inference.
+		now := f.now()
 		f.state = StateDONE
 		f.holdUnresolved()
-		f.log("error", fmt.Sprintf("verification failed (post-reset list): %v", err), "abandon", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
+		d := f.diag()
+		v := &VerifyDiag{At: now, Kind: kind, PreAvailable: f.attempt.PreSnapshot.AvailableCount,
+			Consumption: "inconclusive", Recovery: "unknown"}
+		if d.FirstVerify == nil {
+			d.FirstVerify = v
+		}
+		d.LatestVerify = v
+		d.Seq++
+		const detail = "pinned target identity unavailable; verification queries not performed; prior outcome evidence retained"
+		f.noteHold(now, "target_identity_unavailable", detail)
+		f.log("warn", detail, "review saved evidence (hold)", nil,
+			f.corr(map[string]any{"phase": "verify", "verify_kind": kind, "observed_at": now,
+				"list_ok": false, "usage_ok": false, "target_status": "inconclusive", "recovery": "unknown",
+				"hold_cause": "target_identity_unavailable"}))
+		return time.Time{}
+	}
+	credits, err := f.Client.ListAllCredits(f.Creds)
+	if err != nil {
+		now := f.now()
+		f.state = StateDONE
+		d := f.diag()
+		vd := &VerifyDiag{At: now, Kind: kind, ListErrorKind: errKind(err),
+			PreAvailable: f.attempt.PreSnapshot.AvailableCount, Consumption: "unknown", Recovery: "unknown"}
+		if d.FirstVerify == nil {
+			d.FirstVerify = vd
+		}
+		d.LatestVerify = vd
+		f.holdUnresolved()
+		f.noteHold(now, "verification_list_failed", "post-reset credit list failed ("+vd.ListErrorKind+"); target outcome unknown")
+		f.log("error", fmt.Sprintf("verification failed (post-reset list): %v", safeDiagnosticError(err)), "abandon", nil,
+			f.corr(map[string]any{"target_credit_id": f.attempt.TargetCreditID, "phase": "verify", "verify_kind": kind,
+				"observed_at": now, "list_ok": false, "usage_ok": false,
+				"list_error_kind": vd.ListErrorKind, "hold_cause": "verification_list_failed"}))
 		return time.Time{}
 	}
 	reclassify := f.attempt.Classified // an earlier verification already recorded history
@@ -836,14 +1138,19 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	usage, usageErr := f.Client.GetUsage(f.Creds)
 	if usageErr != nil {
 		usage = Snapshot{WeeklyPct: -1}
-		f.log("error", fmt.Sprintf("verification: post-reset usage failed, recovery unknown: %v", usageErr), "verify consumption only", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
+		f.log("error", fmt.Sprintf("verification: post-reset usage failed, recovery unknown: %v", safeDiagnosticError(usageErr)), "verify consumption only", nil,
+			f.corr(map[string]any{"phase": "verify", "verify_kind": kind,
+				"usage_ok": false, "usage_error_kind": errKind(usageErr)}))
 	}
 	// Update lastSnapshot with post-reset data so the UI shows the new state.
 	credits.WeeklyPct = usage.WeeklyPct
+	credits.WeeklyUsedPct = usage.WeeklyUsedPct
+	credits.WeeklyKnown = usage.WeeklyKnown
+	credits.WeeklyResetAt = usage.WeeklyResetAt
 	f.lastSnapshot = credits
 
 	now := f.now()
+	f.lastSnapshot.CapturedAt = now
 	// Classify the pinned target ID across the raw rows:
 	//   status=="available" (any expiry, changed or not) → PRESENT, not consumed
 	//   status redeemed/consumed/used or redeemed_at set → CONSUMED
@@ -880,7 +1187,42 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	quotaUp := usageErr == nil && usage.WeeklyKnown && (usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct)
 
 	f.state = StateDONE
+	observed := "absent"
+	if targetRow != nil {
+		observed = safeToken(strings.ToLower(strings.TrimSpace(targetRow.Status)))
+	}
+	recovery := "not_recovered"
+	switch {
+	case quotaUp:
+		recovery = "recovered"
+	case usageErr != nil || !usage.WeeklyKnown:
+		recovery = "unknown"
+	}
+	vd := &VerifyDiag{At: now, Kind: kind, ListOK: true, TargetObserved: observed,
+		TargetRedeemed: targetRow != nil && targetRow.Redeemed,
+		TargetInFlight: targetRow != nil && targetRow.InFlight(), ExpiryExplains: expiryExplains,
+		PreAvailable: f.attempt.PreSnapshot.AvailableCount, PostAvailable: credits.AvailableCount, CountDown1: countDown1,
+		UsageOK: usageErr == nil, UsageErrorKind: errKind(usageErr), WeeklyKnown: usage.WeeklyKnown,
+		WeeklyUsedPct: usage.WeeklyUsedPct, WeeklyPct: usage.WeeklyPct, Consumption: consumption, Recovery: recovery}
+	dg := f.diag()
+	if dg.FirstVerify == nil {
+		dg.FirstVerify = vd
+	}
+	dg.LatestVerify = vd
+	dg.Seq++
 	details := map[string]any{
+		"phase":                 "verify",
+		"verify_kind":           kind,
+		"observed_at":           now,
+		"list_ok":               true,
+		"usage_ok":              usageErr == nil,
+		"usage_error_kind":      errKind(usageErr),
+		"target_observed":       observed,
+		"target_redeemed":       vd.TargetRedeemed,
+		"target_in_flight":      vd.TargetInFlight,
+		"weekly_known":          usage.WeeklyKnown,
+		"post_weekly_used_pct":  usage.WeeklyUsedPct,
+		"recovery":              recovery,
 		"credit_id":             f.attempt.TargetCreditID,
 		"redeem_request_id":     f.attempt.RedeemRequestID,
 		"cycle_reason":          string(f.attempt.CycleReason),
@@ -910,6 +1252,13 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		// Only "consumed and count verified" leaves recovery as the sole open
 		// question that a later patrol may resolve read-only.
 		f.setHold(countDown1) // consumed, recovery pending: never compensate
+		cause := "consumed_recovery_pending"
+		if !countDown1 {
+			cause = "consumed_count_unverified"
+		}
+		f.noteHold(now, cause, fmt.Sprintf("target consumed; available %d->%d (count_down_1=%v), recovery=%s",
+			f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount, countDown1, recovery))
+		details["hold_cause"] = cause
 		f.log("warn",
 			fmt.Sprintf("reset PARTIAL: target %s consumed (count_down_1=%v) but weekly %d%%→%d%% not confirmed recovered; holding, no compensation",
 				shortID(f.attempt.TargetCreditID), countDown1,
@@ -922,6 +1271,11 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 			// unrecognized status is left to the stable-check release.
 			f.attempt.Reverify = true
 		}
+		f.noteHold(now, "verification_mismatch", fmt.Sprintf(
+			"target %s (consumption=%s, expiry_explains=%v); available %d->%d (count_down_1=%v); recovery=%s (weekly known=%v used=%.1f%%)",
+			observed, consumption, expiryExplains, f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
+			countDown1, recovery, usage.WeeklyKnown, usage.WeeklyUsedPct))
+		details["hold_cause"] = "verification_mismatch"
 		f.log("error",
 			fmt.Sprintf("reset MISMATCH: target_status=%s expiry_explains=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
 				consumption, expiryExplains, countDown1, quotaUp),
@@ -946,6 +1300,8 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		PostWeeklyPct:        usage.WeeklyPct,
 		PreCredits:           f.attempt.PreSnapshot.AvailableCount,
 		PostCredits:          credits.AvailableCount,
+		RedeemRequestID:      f.attempt.RedeemRequestID,
+		Diag:                 f.attempt.Diag.clone(),
 	}
 
 	return time.Time{}

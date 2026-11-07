@@ -21,9 +21,9 @@ import (
 
 var (
 	// pluginStateMu guards globalState (shared with managementHandlers.mu).
-	// Lock order: AccountFSM.mu -> pluginStateMu is allowed only on the worker
-	// goroutine (PersistAttempt). Never call into an FSM or the Worker while
-	// holding pluginStateMu from any other goroutine.
+	// Lock order for synchronous saves: FSM.mu -> pluginStateMu on the worker
+	// or the dedicated step/registry/FSM-serialized hold-clear operation.
+	// Never enter Worker/FSM code while holding pluginStateMu.
 	pluginStateMu  sync.Mutex
 	globalState    = &PluginState{Accounts: map[string]AccountRuntime{}}
 	globalWorker   *Worker
@@ -262,6 +262,8 @@ func configurePlugin(raw []byte) error {
 	// This ensures past resets (from before the history feature existed)
 	// are counted in the statistics panel.
 	backfillResetHistoryFromLogs(loaded)
+	// Missing diagnostics are explicit legacy-unavailable evidence.
+	markLegacyDiagnostics(loaded)
 	// Wire StateSync so the management UI sees live FSM state and a restart
 	// resumes mid-cycle. Debounce persistence: only write to disk at most every
 	// stateSyncPersistInterval to avoid hammering the file on tight retry loops.
@@ -319,7 +321,7 @@ func wireWorkerPersistence(w *Worker) {
 	w.RestoreAttempt = func(authID string) ResetAttempt {
 		pluginStateMu.Lock()
 		defer pluginStateMu.Unlock()
-		return globalState.Accounts[authID].Attempt
+		return globalState.Accounts[authID].Attempt.clone()
 	}
 	w.RestoreAutoHold = func(authID string) (bool, bool) {
 		pluginStateMu.Lock()
@@ -328,6 +330,10 @@ func wireWorkerPersistence(w *Worker) {
 		return rt.AutoHold, rt.HoldRecoveryOnly
 	}
 	w.PersistAttempt = persistAttemptNow
+	w.Checkpoint = checkpointAttemptNow
+	w.PersistHoldClear = func(authID string, rt AccountRuntime, pending *ResetRecord, entry LogEntry) error {
+		return persistHoldClearNow(authID, rt, pending, entry, w.Logs().all())
+	}
 }
 
 func currentStatePath() string {
@@ -342,6 +348,13 @@ func currentStatePath() string {
 // persistAttemptNow durably records a new attempt before its first consume.
 // A failed write is returned so the FSM refuses to spend.
 func persistAttemptNow(authID string, a ResetAttempt) error {
+	return checkpointAttemptNow(authID, StateRESETTING, a)
+}
+
+// checkpointAttemptNow synchronously writes an attempt snapshot under the
+// caller's phase. The FSM calls it with FSM.mu held (order FSM.mu ->
+// pluginStateMu); it receives a value snapshot and never calls into the FSM.
+func checkpointAttemptNow(authID string, phase State, a ResetAttempt) error {
 	pluginStateMu.Lock()
 	defer pluginStateMu.Unlock()
 	if globalStatePath == "" {
@@ -349,8 +362,8 @@ func persistAttemptNow(authID string, a ResetAttempt) error {
 	}
 	rt := globalState.Accounts[authID]
 	rt.AuthID = authID
-	rt.State = StateRESETTING
-	rt.Attempt = a
+	rt.State = phase
+	rt.Attempt = a.clone()
 	globalState.Accounts[authID] = rt
 	return saveState(globalStatePath, globalState)
 }
@@ -403,30 +416,93 @@ func syncFSMIntoGlobalState(logs *logRing, authID string, fsm *AccountFSM) (*Res
 	prev := globalState.Accounts[authID]
 	globalState.Accounts[authID] = cur
 	// Hold-release progress is not critical: RestoreAttempt discards it.
+	// Essential diagnostic events (dispatch, verification, hold entry) are
+	// written synchronously too; coalesced held-patrol updates are not.
 	critical := prev.Attempt.RedeemRequestID != cur.Attempt.RedeemRequestID ||
-		prev.AutoHold != cur.AutoHold || prev.HoldRecoveryOnly != cur.HoldRecoveryOnly
+		prev.AutoHold != cur.AutoHold || prev.HoldRecoveryOnly != cur.HoldRecoveryOnly ||
+		diagSeq(prev.Attempt) != diagSeq(cur.Attempt)
 	var rec *ResetRecord
-	if r != nil && r.ResolvesEarlier {
-		// Read-only recovery of an earlier "recovery pending" record.
-		for i := len(globalState.ResetHistory) - 1; i >= 0; i-- {
-			h := &globalState.ResetHistory[i]
-			if h.AuthID == r.AuthID && h.CreditID == r.CreditID && !h.Success {
-				h.Success, h.RecoveryConfirmed, h.PostWeeklyPct = true, true, r.PostWeeklyPct
-				break
-			}
-		}
-		rec = r
-	} else if r != nil {
-		globalState.ResetHistory = append(globalState.ResetHistory, *r)
-		// Cap at 500 entries (FIFO).
-		if len(globalState.ResetHistory) > 500 {
-			globalState.ResetHistory = globalState.ResetHistory[len(globalState.ResetHistory)-500:]
+	if r != nil {
+		var found bool
+		globalState.ResetHistory, found = upsertResetHistory(globalState.ResetHistory, *r)
+		if !found {
+			logs.append(LogEntry{Timestamp: time.Now(), Level: "warn", Scope: authID,
+				Message: "recovery confirmed, but the earlier history record is missing or ambiguous; history left unchanged",
+				Details: map[string]any{"redeem_request_id": r.RedeemRequestID, "credit_id": r.CreditID}})
 		}
 		rec = r
 	}
 	// Also sync logs to the persisted state.
 	globalState.Logs = logs.all()
 	return rec, critical
+}
+
+// resetHistoryCap bounds retained reset history (FIFO).
+const resetHistoryCap = 500
+
+func trimResetHistory(hist []ResetRecord) []ResetRecord {
+	if len(hist) > resetHistoryCap {
+		return hist[len(hist)-resetHistoryCap:]
+	}
+	return hist
+}
+
+// upsertResetHistory records r. A record carrying a RedeemRequestID updates
+// the existing record of the same (AuthID, RedeemRequestID) in place, so
+// re-verification or audit updates never add a fake reset nor inflate
+// consumed-credit counts; positive consumption/recovery evidence is
+// monotonic. A read-only recovery (ResolvesEarlier) upgrades only its exact
+// record, or a single unambiguous legacy record without an ID; otherwise it
+// changes nothing and reports found=false. Records with different IDs are
+// never merged, even for the same credit or second.
+func upsertResetHistory(hist []ResetRecord, r ResetRecord) ([]ResetRecord, bool) {
+	r.Diag = r.Diag.clone()
+	idx := -1
+	if r.RedeemRequestID != "" {
+		for i := len(hist) - 1; i >= 0; i-- {
+			if hist[i].AuthID == r.AuthID && hist[i].RedeemRequestID == r.RedeemRequestID {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 && r.ResolvesEarlier {
+		for i := range hist {
+			h := hist[i]
+			if h.AuthID == r.AuthID && h.CreditID == r.CreditID && !h.Success && h.RedeemRequestID == "" {
+				if idx >= 0 {
+					return hist, false // ambiguous legacy match: never guess
+				}
+				idx = i
+			}
+		}
+		if idx < 0 {
+			return hist, false
+		}
+	}
+	if idx < 0 {
+		return trimResetHistory(append(hist, r)), true
+	}
+	h := &hist[idx]
+	if r.ResolvesEarlier {
+		h.RedeemRequestID = r.RedeemRequestID
+		h.Success, h.RecoveryConfirmed, h.PostWeeklyPct = true, true, r.PostWeeklyPct
+		h.ConsumptionConfirmed = h.ConsumptionConfirmed || r.ConsumptionConfirmed
+		if r.Diag != nil {
+			h.Diag = r.Diag
+		}
+		return trimResetHistory(hist), true
+	}
+	// Same attempt, newer observation: keep the original timestamp/position
+	// and pre-reset facts; refresh the outcome with monotonic evidence.
+	h.Success = h.Success || r.Success
+	h.ConsumptionConfirmed = h.ConsumptionConfirmed || r.ConsumptionConfirmed
+	h.RecoveryConfirmed = h.RecoveryConfirmed || r.RecoveryConfirmed
+	h.PostWeeklyPct, h.PostCredits = r.PostWeeklyPct, r.PostCredits
+	if r.Diag != nil {
+		h.Diag = r.Diag
+	}
+	return trimResetHistory(hist), true
 }
 
 // afterVerifiedReset clears CPA's own model/credential cooldown for an
@@ -552,6 +628,7 @@ func managementRegistrationResponse() pluginapi.ManagementRegistrationResponse {
 		{Method: http.MethodPut, Path: "/plugins/codex-auto-reset/settings"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/check/all"},
+		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/clear-hold"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/reset"},
 		{Method: http.MethodGet, Path: "/plugins/codex-auto-reset/export"},
 		{Method: http.MethodPost, Path: "/plugins/codex-auto-reset/import"},
@@ -713,90 +790,104 @@ func migrateLegacyState(newPath string) {
 // already in ResetHistory. This ensures past resets (from before the history
 // feature was added) are counted in statistics. Deduplicates by timestamp+authID.
 func backfillResetHistoryFromLogs(state *PluginState) {
-	// Collapse duplicates recorded by earlier versions (same authID + creditID
-	// + second), keeping the first occurrence. Runs even with no logs so stale
-	// duplicates in an upgraded state file are cleaned up.
 	collapseResetHistoryDuplicates(state)
-
-	if len(state.Logs) == 0 {
-		return
-	}
-	// Dedup key: authID + creditID + second-truncated timestamp. The history
-	// record (from pendingHistory) and the log entry for the SAME reset carry
-	// two separate time.Now() readings that differ by nanoseconds, so
-	// nanosecond-precision keys never match and every restart appended a
-	// duplicate. Second-granularity + creditID is exact enough: one credit is
-	// consumed at most once per second, and credit IDs are unique.
+	// Only legacy records without request identity use the old second-level
+	// fingerprint. Identified attempts always upsert by account/request ID.
 	backfillKey := func(authID, creditID string, ts time.Time) string {
 		return authID + "|" + creditID + "|" + ts.Truncate(time.Second).Format(time.RFC3339)
 	}
 	existing := make(map[string]bool, len(state.ResetHistory))
+	ids := make(map[string]bool, len(state.ResetHistory))
+	legacy := make(map[string]bool)
 	for _, r := range state.ResetHistory {
-		existing[backfillKey(r.AuthID, r.CreditID, r.Timestamp)] = true
+		key := backfillKey(r.AuthID, r.CreditID, r.Timestamp)
+		existing[key] = true
+		if r.RedeemRequestID != "" {
+			ids[r.AuthID+"|"+r.RedeemRequestID] = true
+		} else {
+			legacy[key] = true
+		}
 	}
-
 	for _, e := range state.Logs {
-		// Only process DONE-state entries that mention "reset".
-		if e.State != StateDONE {
+		if e.State != StateDONE || e.Details == nil {
 			continue
 		}
 		details := e.Details
-		if details == nil {
-			continue
+		phase, _ := details["phase"].(string)
+		if phase != "" && phase != "verify" {
+			continue // authorization/hold/clear audit entries are not resets
 		}
-		// Check if this log has reset verification data.
 		preCredits, _ := details["pre_credits"].(float64)
 		postCredits, _ := details["post_credits"].(float64)
 		preWeekly, _ := details["pre_weekly_pct"].(float64)
 		postWeekly, _ := details["post_weekly_pct"].(float64)
 		creditID, _ := details["credit_id"].(string)
-
-		// Skip if no meaningful data.
-		if preCredits == 0 && postCredits == 0 && creditID == "" {
+		if _, ok := details["pre_credits"]; !ok || (preCredits == 0 && postCredits == 0 && creditID == "") {
 			continue
 		}
-
+		rid, _ := details["redeem_request_id"].(string)
 		key := backfillKey(e.Scope, creditID, e.Timestamp)
-		if existing[key] {
+		if rid == "" && existing[key] {
 			continue
 		}
-
-		// Determine success from the log message.
-		success := false
-		if strings.Contains(e.Message, "verified OK") {
-			success = true
+		if rid != "" && !ids[e.Scope+"|"+rid] && legacy[key] {
+			// A legacy record already covers this observation but cannot be
+			// linked safely to a request ID. Do not invent a second reset.
+			continue
 		}
-
-		state.ResetHistory = append(state.ResetHistory, ResetRecord{
-			Timestamp:     e.Timestamp,
-			AuthID:        e.Scope,
-			CreditID:      creditID,
-			Success:       success,
-			PreWeeklyPct:  int(preWeekly),
-			PostWeeklyPct: int(postWeekly),
-			PreCredits:    int(preCredits),
-			PostCredits:   int(postCredits),
+		consumed, hasConsumption := details["consumption_confirmed"].(bool)
+		recovered, hasRecovery := details["quota_recovered"].(bool)
+		countDown, _ := details["count_down_1"].(bool)
+		success := consumed && recovered && countDown
+		if phase == "" && !hasConsumption && !hasRecovery {
+			// Preserve old success backfill without fabricating separate
+			// consumption evidence that those logs did not record.
+			success = strings.Contains(e.Message, "verified OK")
+		}
+		state.ResetHistory, _ = upsertResetHistory(state.ResetHistory, ResetRecord{
+			Timestamp: e.Timestamp, AuthID: e.Scope, CreditID: creditID, RedeemRequestID: rid,
+			Success: success, ConsumptionConfirmed: consumed, RecoveryConfirmed: recovered,
+			PreWeeklyPct: int(preWeekly), PostWeeklyPct: int(postWeekly),
+			PreCredits: int(preCredits), PostCredits: int(postCredits),
 		})
 		existing[key] = true
+		if rid != "" {
+			ids[e.Scope+"|"+rid] = true
+		} else {
+			legacy[key] = true
+		}
 	}
-
 }
 
-// collapseResetHistoryDuplicates removes records sharing (authID, creditID,
-// second), keeping the first occurrence. Repairs state files polluted by the
-// pre-0.1.8 nanosecond-dedup bug in backfill.
+// collapseResetHistoryDuplicates merges exact account/request duplicates,
+// preserving positive evidence. Only unidentified legacy records use the old
+// account/credit/second fingerprint and first-record behavior.
 func collapseResetHistoryDuplicates(state *PluginState) {
-	seen := make(map[string]bool, len(state.ResetHistory))
+	seen := make(map[string]int, len(state.ResetHistory))
 	deduped := state.ResetHistory[:0]
 	for _, r := range state.ResetHistory {
-		key := r.AuthID + "|" + r.CreditID + "|" + r.Timestamp.Truncate(time.Second).Format(time.RFC3339)
-		if seen[key] {
+		key := r.AuthID + "|id|" + r.RedeemRequestID
+		if r.RedeemRequestID == "" {
+			key = r.AuthID + "|legacy|" + r.CreditID + "|" + r.Timestamp.Truncate(time.Second).Format(time.RFC3339)
+		}
+		if idx, ok := seen[key]; ok {
+			if r.RedeemRequestID != "" {
+				h := &deduped[idx]
+				h.Success = h.Success || r.Success
+				h.ConsumptionConfirmed = h.ConsumptionConfirmed || r.ConsumptionConfirmed
+				h.RecoveryConfirmed = h.RecoveryConfirmed || r.RecoveryConfirmed
+				h.PostWeeklyPct, h.PostCredits = r.PostWeeklyPct, r.PostCredits
+				if r.Diag != nil {
+					h.Diag = r.Diag.clone()
+				}
+			}
 			continue
 		}
-		seen[key] = true
+		seen[key] = len(deduped)
+		r.Diag = r.Diag.clone()
 		deduped = append(deduped, r)
 	}
-	state.ResetHistory = deduped
+	state.ResetHistory = trimResetHistory(deduped)
 }
 
 // stateSyncPersistInterval bounds how often StateSync writes to disk. The

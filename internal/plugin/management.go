@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -99,6 +100,9 @@ func (h *managementHandlers) handle(method, rawPath string, headers http.Header,
 			}
 		}
 		st, b := jsonOK(map[string]any{"triggered": "all"})
+		return st, b, "application/json"
+	case method == http.MethodPost && path == "/clear-hold":
+		st, b := h.clearHold(body)
 		return st, b, "application/json"
 	case method == http.MethodPost && path == "/reset":
 		st, b := h.resetOne(body)
@@ -406,10 +410,78 @@ func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
 	return jsonOK(map[string]any{"forced": req.AuthIndex})
 }
 
+// clearHold runs only on a registered Management route. CPA owns its key
+// authentication; the resource guard in handle keeps this mutation private.
+func (h *managementHandlers) clearHold(body []byte) (int, []byte) {
+	var req struct {
+		AuthIndex string  `json:"auth_index"`
+		Confirm   *bool   `json:"confirm"`
+		Expected  *string `json:"expected_redeem_request_id"`
+	}
+	invalid := func(reason, field string) (int, []byte) {
+		return jsonStatus(http.StatusBadRequest, map[string]any{"error": "invalid_request", "reason": reason, "field": field})
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return invalid("malformed_json", "")
+	}
+	if strings.TrimSpace(req.AuthIndex) == "" {
+		return invalid("account_required", "auth_index")
+	}
+	if req.Confirm == nil || !*req.Confirm {
+		return invalid("confirmation_required", "confirm")
+	}
+	if req.Expected == nil {
+		return invalid("expected_identity_required", "expected_redeem_request_id")
+	}
+	h.mu.Lock()
+	_, known := h.state.Accounts[req.AuthIndex]
+	if !known {
+		for _, id := range h.state.Config.EnabledAccounts {
+			if id == req.AuthIndex {
+				known = true
+				break
+			}
+		}
+	}
+	worker := h.worker
+	h.mu.Unlock() // never enter Worker/FSM code while holding pluginStateMu
+	if !known {
+		return jsonStatus(http.StatusNotFound, map[string]any{"error": "account_not_found", "reason": "account_not_found"})
+	}
+	if worker == nil {
+		return jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "hold_clear_unavailable", "reason": "worker_unavailable"})
+	}
+	cleared, err := worker.ClearHold(req.AuthIndex, *req.Expected)
+	if err != nil {
+		reason := holdClearReason(err)
+		switch {
+		case errors.Is(err, ErrHoldClearConflict):
+			if reason == "" {
+				reason = "conflict"
+			}
+			return jsonStatus(http.StatusConflict, map[string]any{"error": "hold_clear_conflict", "reason": reason})
+		case errors.Is(err, ErrHoldClearUnavailable):
+			if reason == "" {
+				reason = "worker_unavailable"
+			}
+			return jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "hold_clear_unavailable", "reason": reason})
+		default:
+			return jsonStatus(http.StatusInternalServerError, map[string]any{"error": "hold_clear_persistence_failed", "reason": "persistence_failed"})
+		}
+	}
+	outcome := "already_clear"
+	if cleared {
+		outcome = "cleared"
+	}
+	return jsonOK(map[string]any{"auth_index": req.AuthIndex, "cleared": cleared, "already_clear": !cleared, "outcome": outcome})
+}
+
 func (h *managementHandlers) exportState() (int, []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	raw, _ := json.MarshalIndent(h.state, "", "  ")
+	snapshot := *h.state
+	snapshot.Logs = redactLogEntries(h.state.Logs)
+	raw, _ := json.MarshalIndent(&snapshot, "", "  ")
 	return http.StatusOK, raw
 }
 
@@ -422,6 +494,7 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 	if s.Accounts == nil {
 		s.Accounts = map[string]AccountRuntime{}
 	}
+	markLegacyDiagnostics(&s) // imported history without diagnostics is explicit legacy
 	h.mu.Lock()
 	prev := *h.state
 	s.Config.StateDir = prev.Config.StateDir // operator-owned location stays
@@ -430,7 +503,7 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 	// false promise, and erasing a live one would break the pre-consume
 	// durability guarantee. Policy and history are imported.
 	h.state.Config = s.Config
-	h.state.ResetHistory = s.ResetHistory
+	h.state.ResetHistory = trimResetHistory(s.ResetHistory)
 	if err := saveState(h.statePath, h.state); err != nil {
 		*h.state = prev // transactional: nothing changes on a failed write
 		h.mu.Unlock()
@@ -569,6 +642,15 @@ func renderStatusHTML(state *PluginState) string {
       text-transform: uppercase; letter-spacing: .04em; display: block; margin-bottom: 3px; }
     .inherit-hint { font-size: 10px; color: var(--text-muted); font-style: italic; }
     .eff-val { font-size: 11px; color: var(--text-muted); }
+    .diagnostic-details { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-top: 8px; max-width: 100%; }
+    .diagnostic-details summary { cursor: pointer; font-weight: 600; }
+    .diag-content, .diagnostic-details dl { min-width: 0; }
+    .diag-row { display: grid; grid-template-columns: minmax(150px, 34%) minmax(0, 1fr); gap: 8px; padding: 3px 0; }
+    .diag-row dt { color: var(--muted); }
+    .diag-row dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .diag-compact { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+    .dispatch-diag, .verify-diag { border-top: 1px solid var(--border); padding-top: 6px; margin-top: 6px; }
+    .diagnostic-details h4 { margin: 10px 0 4px; }
     .card-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
     .credit-line { font-size: 12px; word-break: break-all; }
     .credit-line .cid { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-weight: 600; }
@@ -755,6 +837,37 @@ func renderStatusHTML(state *PluginState) string {
         inheritOpt: "Inherit global", onOpt: "On", offOpt: "Off",
         patrolLbl: "Patrol", leadLbl: "Lead", noAccounts: "No Codex accounts found.",
         logs: "Logs", resetStats: "Reset statistics", total: "Total", lastUpdated: "Updated",
+        diagRecoveryOnly: "Recovery-only hold: await quota recovery", diagRecordedBlocker: "Last recorded blocker", diagRecordedNext: "Historical planned check (not current schedule)", diagFirstSeen: "First observed at", diagRepeats: "Coalesced observations",
+        diagRetryDecision: "Wait for retry", diagVerifyDecision: "Verify consumption/recovery", diagStopDecision: "Stop", diagStopHold: "Stop and retain safety hold", diagReleased: "Automatic stable release", diagAuthPhase: "Authorization recorded", diagIntentPhase: "Dispatch intent recorded", diagResultPhase: "Dispatch result recorded", diagHoldPhase: "Safety hold entered", diagPatrolPhase: "Read-only held patrol", diagClearPhase: "Operator override recorded", diagExpiryReason: "Credit expiry eligibility",
+        diagTitle: "Attempt diagnostics", diagHistory: "Retained attempt evidence", diagLog: "Structured event evidence",
+        diagOriginal: "Original hold", diagSince: "Hold began", diagBlocker: "Current blocker", diagProgress: "Release progress (stable checks/recovery)", diagNext: "Next saved action/check",
+        diagHistorical: "Historical hold, not current state", diagOverride: "Operator cleared — not reset success",
+        diagUnavailable: "Unavailable / not recorded", diagNoDispatch: "No dispatch observation recorded; not proof of no send",
+        diagAuth: "Authorization / policy", diagDispatch: "Recorded dispatch observations (not consumed cards)",
+        diagFirst: "First verification", diagLatest: "Latest verification / reconciliation", diagRequest: "Request identity", diagTarget: "Target identity",
+        diagAt: "Observed/recorded at", diagReason: "Reason", diagExpiry: "Pinned expiry", diagPreCount: "Pre-reset available", diagPostCount: "Observed available",
+        diagUsed: "Known weekly usage (%)", diagResetAt: "Weekly recovery time", diagWeeklyOpt: "Weekly exhaustion enabled", diagDefer: "Defer near recovery enabled", diagLimit: "Limit expiry-window spending enabled", diagGuard: "Recovery guard", diagWindow: "Credit usage window", diagLead: "Expiry lead",
+        diagIndex: "Retry index (0 = first invocation)", diagIntent: "Dispatch intent at", diagDelivery: "Delivery evidence", diagHTTP: "HTTP status", diagAPI: "Reported API code", diagWindows: "Returned windows_reset", diagElapsed: "Recorded elapsed (ms)", diagError: "Error category", diagDecision: "Next decision", diagRetry: "Retry scheduled for",
+        diagKind: "Observation kind", diagList: "Credit query succeeded", diagUsage: "Usage query succeeded", diagStatus: "Observed target status", diagRedeemed: "Upstream redeemed_at present", diagInFlight: "Observed in-flight redemption", diagExpiryAmbiguity: "Expiry can explain absence", diagConsumption: "Consumption conclusion", diagRecovery: "Recovery conclusion", diagClearAt: "Operator clear recorded at", diagYes: "Yes", diagNo: "No",
+        diagPending: "Intent only; result not recorded", diagReceived: "Response received — not proof of consumption", diagUnknown: "Unknown / uncertain", diagNotSent: "Local validation prevented sending", diagPostDispatch: "Post-dispatch verification", diagReverify: "Read-only reconciliation (no new consume)",
+        diagPresent: "Target still present", diagConsumed: "Consumption confirmed", diagInconclusive: "Inconclusive", diagRecovered: "Recovery confirmed", diagNotRecovered: "Recovery not confirmed",
+        diagMissingTarget: "Pinned target unavailable; verification queries not performed", diagMismatch: "Verification mismatch", diagListFailed: "Verification credit query failed", diagRecoveryPending: "Consumed; recovery pending", diagCountPending: "Consumed; count unresolved", diagOutcomeUnknown: "Consume outcome uncertain", diagRetries: "Retries exhausted", diagExpired: "Target expired after an earlier dispatch", diagExhausted: "Weekly quota remains exhausted", diagUsageUnknown: "Weekly usage unavailable", diagUsageFailed: "Weekly query failed", diagInFlightBlock: "Redemption remains in flight", diagChangedCount: "Available count changed", diagSpacing: "Stable-check interval not reached", diagStable: "Stable check counted",
+        clearHold: "Clear hold", holdAttempt: "Held request", holdTarget: "Target credit", holdCause: "Hold cause",
+        holdConfirm: "Clear this automatic-spending hold?", holdUnknown: "Evidence unavailable",
+        holdConfirmed: "Confirmed", holdNotConfirmed: "Not confirmed",
+        holdLegacy: "Some legacy request/verification evidence is unavailable.",
+        holdRisk: "This action does not query upstream or redeem a credit. LATER ordinary automation may still use a credit when normal policy permits. Previous outcomes are not reclassified.",
+        holdCleared: "Hold cleared by operator; previous outcome unchanged. No reset was requested.",
+        holdAlready: "Already clear; no reset was requested.", holdPending: "Clearing hold…",
+        holdBusy: "Worker is busy. Hold was not cleared. Wait, then read saved status before trying again.",
+        holdActive: "Confirmation, redemption or verification is active. Hold was not cleared; wait for it to finish.",
+        holdStale: "The displayed held attempt changed. Read saved status and review the current attempt before confirming again.",
+        holdAmbiguous: "Legacy history association is ambiguous. Hold was not cleared. Review the historical evidence; a status refresh alone will not resolve this. No automatic retry will run.",
+        holdUnavailable: "Hold was not cleared: worker or persistence is unavailable.",
+        holdSaveFailed: "Hold was not cleared because the override could not be saved safely.",
+        holdInvalid: "The hold-clear request was rejected. Read saved status before confirming again.",
+        holdUncertain: "Clear outcome is unknown; the hold may already have been cleared. Read saved status before deciding whether to submit another request.",
+        holdRefresh: "Read saved status", holdRefreshFailed: "Saved status could not be read.",
         confirmReset: "Redeem a reset credit for this account now (manual)?",
         confirmRestore: "Remove this account's policy overrides (inherit global defaults)? No credit is consumed.",
         consumption: "Consumption", recovery: "Recovery", consumed: "consumed", recoveryPending: "recovery pending",
@@ -796,6 +909,37 @@ func renderStatusHTML(state *PluginState) string {
         inheritOpt: "继承全局", onOpt: "开启", offOpt: "关闭",
         patrolLbl: "巡查", leadLbl: "提前量", noAccounts: "未发现 Codex 账号。",
         logs: "日志", resetStats: "重置统计", total: "总计", lastUpdated: "更新于",
+        diagRecoveryOnly: "仅等待额度恢复的暂停", diagRecordedBlocker: "最后记录的阻挡原因", diagRecordedNext: "历史计划检查时间（不是当前调度）", diagFirstSeen: "首次观测于", diagRepeats: "合并的观测次数",
+        diagRetryDecision: "等待重试", diagVerifyDecision: "校验消费与恢复", diagStopDecision: "停止", diagStopHold: "停止并保留安全暂停", diagReleased: "自动稳定解除", diagAuthPhase: "已记录授权", diagIntentPhase: "已记录派发意图", diagResultPhase: "已记录派发结果", diagHoldPhase: "进入安全暂停", diagPatrolPhase: "暂停期间的只读巡检", diagClearPhase: "已记录人工覆盖", diagExpiryReason: "临期卡资格条件",
+        diagTitle: "请求诊断", diagHistory: "保留的历史请求证据", diagLog: "结构化事件证据",
+        diagOriginal: "原始暂停原因", diagSince: "暂停开始于", diagBlocker: "当前阻挡原因", diagProgress: "解除进度（稳定检查／额度恢复）", diagNext: "已保存的下一步／检查时间",
+        diagHistorical: "历史暂停信息，不代表当前仍暂停", diagOverride: "人工已解除，不代表重置成功",
+        diagUnavailable: "不可用／未记录", diagNoDispatch: "没有派发观测记录，不代表未发送",
+        diagAuth: "授权依据／策略", diagDispatch: "已记录的派发观测（不是用卡数量）",
+        diagFirst: "首次校验", diagLatest: "最新校验／只读复核", diagRequest: "请求标识", diagTarget: "目标卡标识",
+        diagAt: "观测／记录时间", diagReason: "原因", diagExpiry: "固定的到期时间", diagPreCount: "兑换前可用卡数", diagPostCount: "观测到的可用卡数",
+        diagUsed: "已知周用量（%）", diagResetAt: "周额度恢复时间", diagWeeklyOpt: "周耗尽兑换已开启", diagDefer: "临近恢复时延迟已开启", diagLimit: "限制临期窗口用卡已开启", diagGuard: "周恢复保护", diagWindow: "临期用卡窗口", diagLead: "到期提前量",
+        diagIndex: "重试索引（0 表示首次调用）", diagIntent: "派发意图记录时间", diagDelivery: "送达证据", diagHTTP: "HTTP 状态", diagAPI: "客户端报告的 API 代码", diagWindows: "返回的 windows_reset", diagElapsed: "已记录耗时（毫秒）", diagError: "错误类别", diagDecision: "下一步判定", diagRetry: "计划重试时间",
+        diagKind: "观测类型", diagList: "卡列表查询成功", diagUsage: "用量查询成功", diagStatus: "观测到的目标状态", diagRedeemed: "上游存在 redeemed_at", diagInFlight: "观测到兑换进行中", diagExpiryAmbiguity: "到期可以解释卡片消失", diagConsumption: "消费结论", diagRecovery: "恢复结论", diagClearAt: "人工解除记录时间", diagYes: "是", diagNo: "否",
+        diagPending: "仅记录派发意图，未记录结果", diagReceived: "已收到响应，不等于确认消费", diagUnknown: "未知／不确定", diagNotSent: "本地校验阻止发送", diagPostDispatch: "派发后的校验", diagReverify: "只读复核（没有新的兑换）",
+        diagPresent: "目标卡仍存在", diagConsumed: "已确认消费", diagInconclusive: "无法定论", diagRecovered: "已确认恢复", diagNotRecovered: "未确认恢复",
+        diagMissingTarget: "固定目标标识不可用，未执行校验查询", diagMismatch: "校验不匹配", diagListFailed: "校验时卡列表查询失败", diagRecoveryPending: "已消费，恢复待确认", diagCountPending: "已消费，卡数未核实", diagOutcomeUnknown: "兑换结果不确定", diagRetries: "重试耗尽", diagExpired: "先前派发后目标已到期", diagExhausted: "周额度仍然耗尽", diagUsageUnknown: "周用量不可用", diagUsageFailed: "周用量查询失败", diagInFlightBlock: "兑换仍在进行中", diagChangedCount: "可用卡数变化", diagSpacing: "稳定检查间隔尚未满足", diagStable: "已计入稳定检查",
+        clearHold: "解除暂停", holdAttempt: "已暂停的请求", holdTarget: "目标卡", holdCause: "暂停原因",
+        holdConfirm: "确认解除此自动用卡暂停？", holdUnknown: "证据不可用",
+        holdConfirmed: "已确认", holdNotConfirmed: "未确认",
+        holdLegacy: "部分旧版本请求或校验证据不可用。",
+        holdRisk: "此操作不会查询上游或兑换卡。之后正常自动流程仍可能在策略允许时用卡。之前的结果不会被重新判定。",
+        holdCleared: "已由人工解除暂停，之前的结果保持不变；未请求重置。",
+        holdAlready: "当前已无暂停；未请求重置。", holdPending: "正在解除暂停…",
+        holdBusy: "Worker 正忙，未解除暂停。请稍候读取已保存状态后再决定是否重试。",
+        holdActive: "确认、兑换或校验正在进行，未解除暂停；请等待操作完成。",
+        holdStale: "页面中的暂停请求已变化。请读取已保存状态，核对当前请求后再确认。",
+        holdAmbiguous: "旧历史记录的关联存在歧义，未解除暂停。请核对历史证据；仅刷新状态不能解决此歧义，也不会自动重试。",
+        holdUnavailable: "Worker 或持久化不可用，未解除暂停。",
+        holdSaveFailed: "无法安全保存人工解除记录，暂停仍保留。",
+        holdInvalid: "解除暂停请求被拒绝，请读取已保存状态后重新确认。",
+        holdUncertain: "解除结果未知，暂停可能已经解除。请先读取已保存状态，再决定是否发出新请求。",
+        holdRefresh: "读取已保存状态", holdRefreshFailed: "无法读取已保存状态。",
         confirmReset: "立即为该账号兑换一次重置额度（手动）？",
         confirmRestore: "移除该账号的策略覆盖（恢复继承全局默认）？不会消耗额度。",
         consumption: "消耗", recovery: "恢复", consumed: "已消耗", recoveryPending: "恢复待确认",
@@ -836,6 +980,9 @@ func renderStatusHTML(state *PluginState) string {
     var state = { locale: "en", key: "", status: null, accounts: [], policies: {},
       logs: [], lastUpdated: null, authFailed: false };
     var rowDrafts = {};   // authIndex -> dirty flag; polling must not clobber
+    var clearPending = Object.create(null); // explicit action, never a worker wake
+    var clearFeedback = Object.create(null);
+    var diagExpanded = Object.create(null);
     var activeDrag = null;
     var globalDirty = false;
     var pollTimer = null;
@@ -905,11 +1052,14 @@ func renderStatusHTML(state *PluginState) string {
         method, headers: Object.assign({}, authHeaders(), {"Content-Type":"application/json"}),
         body: body === undefined ? undefined : JSON.stringify(body)
       });
-      if (r.status === 401 || r.status === 403) { authFail(); throw new Error("auth"); }
+      if (r.status === 401 || r.status === 403) { authFail(); const e = new Error("auth"); e.status = r.status; throw e; }
       if (!r.ok) {
-        let msg = path + ": " + r.status;
-        try { const j = await r.json(); if (j.error) msg = j.error; } catch(_) {}
-        throw new Error(msg);
+        let msg = path + ": " + r.status, details = {};
+        try { const j = await r.json(); if (j && typeof j === "object") { details = j; if (typeof j.error === "string") msg = j.error; } } catch(_) {}
+        const e = new Error(msg);
+        e.status = r.status; e.code = typeof details.error === "string" ? details.error : "";
+        e.reason = typeof details.reason === "string" ? details.reason : "";
+        throw e;
       }
       return r.json().catch(() => ({}));
     }
@@ -953,6 +1103,155 @@ func renderStatusHTML(state *PluginState) string {
       }
     }
 
+    function diagScalar(value) {
+      if (typeof value === "boolean") return t(value ? "diagYes" : "diagNo");
+      if (typeof value === "number") return Number.isFinite(value) ? String(value) : t("diagUnavailable");
+      return typeof value === "string" && value ? value.slice(0,512) : t("diagUnavailable");
+    }
+    function diagNumber(o, key) {
+      return o && Object.prototype.hasOwnProperty.call(o,key) && typeof o[key] === "number" && Number.isFinite(o[key]) && o[key] >= 0 ? String(o[key]) : t("diagUnavailable");
+    }
+    function diagTime(value) {
+      if (typeof value !== "string" || !value || value.indexOf("0001-") === 0) return t("diagUnavailable");
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? t("diagUnavailable") : date.toLocaleString(state.locale === "zh" ? "zh-CN" : "en-US", {timeZoneName:"short"}) + " [" + value.slice(0,80) + "]";
+    }
+    function diagEnum(value) {
+      const labels = {retry:"diagRetryDecision",verify:"diagVerifyDecision",stop:"diagStopDecision",stop_hold:"diagStopHold",released:"diagReleased",authorized:"diagAuthPhase",dispatch_intent:"diagIntentPhase",dispatch_result:"diagResultPhase",hold_entered:"diagHoldPhase",hold_continued:"diagPatrolPhase",operator_clear:"diagClearPhase",expiry:"diagExpiryReason",pending:"diagPending",response_received:"diagReceived",unknown:"diagUnknown",not_sent:"diagNotSent",
+        post_dispatch:"diagPostDispatch",reverify:"diagReverify",present:"diagPresent",consumed:"diagConsumed",inconclusive:"diagInconclusive",recovered:"diagRecovered",not_recovered:"diagNotRecovered",
+        target_identity_unavailable:"diagMissingTarget",verification_mismatch:"diagMismatch",verification_list_failed:"diagListFailed",consumed_recovery_pending:"diagRecoveryPending",consumed_count_unverified:"diagCountPending",consume_outcome_unknown:"diagOutcomeUnknown",retries_exhausted:"diagRetries",target_expired_after_dispatch:"diagExpired",
+        list_read_failed:"diagListFailed",weekly_exhausted:"diagExhausted",weekly_unknown:"diagUsageUnknown",usage_read_failed:"diagUsageFailed",redemption_in_flight:"diagInFlightBlock",count_changed:"diagChangedCount",spacing_not_reached:"diagSpacing",stable_check_counted:"diagStable",recovery_pending:"diagRecoveryPending",unavailable:"diagUnavailable"};
+      return typeof value === "string" && Object.prototype.hasOwnProperty.call(labels,value) ? t(labels[value]) + " (" + value + ")" : diagScalar(value);
+    }
+    function diagRow(label, value) {
+      return '<div class="diag-row" data-diag-label="' + label + '"><dt>' + esc(t(label)) + '</dt><dd>' + esc(diagScalar(value)) + '</dd></div>';
+    }
+    function diagVerification(v, label, legacy) {
+      let html = '<section class="verify-diag"><h4>' + esc(t(label)) + '</h4><dl>';
+      if (!v) return html + diagRow("diagAt",t("diagUnavailable")) + '</dl></section>';
+      html += diagRow("diagAt",diagTime(v.at)) + diagRow("diagKind",diagEnum(v.kind)) + diagRow("diagList",v.list_ok) + diagRow("diagUsage",v.usage_ok);
+      html += diagRow("diagPreCount",legacy ? t("diagUnavailable") : diagNumber(v,"pre_available")) + diagRow("diagPostCount",v.list_ok ? diagNumber(v,"post_available") : t("diagUnavailable"));
+      html += diagRow("diagStatus",v.list_ok ? v.target_observed : t("diagUnavailable")) + diagRow("diagRedeemed",v.target_redeemed) + diagRow("diagInFlight",v.target_in_flight) + diagRow("diagExpiryAmbiguity",v.expiry_explains);
+      html += diagRow("diagUsed",v.usage_ok && v.weekly_known ? diagNumber(v,"weekly_used_pct") : t("diagUnavailable"));
+      html += diagRow("diagConsumption",diagEnum(v.consumption)) + diagRow("diagRecovery",diagEnum(v.recovery));
+      if (v.list_error_kind || v.usage_error_kind) html += diagRow("diagError",v.list_error_kind || v.usage_error_kind);
+      return html + '</dl></section>';
+    }
+    function diagnosticHTML(d, info, key, kind, held) {
+      const legacy = !d || !!d.legacy_unavailable;
+      let html = '<details class="diagnostic-details" data-diag-key="' + esc(key) + '" data-diag-kind="' + kind + '"' + (diagExpanded[key] ? ' open' : '') + '><summary>' + esc(t(kind === "history" ? "diagHistory" : "diagTitle")) + '</summary><div class="diag-content">';
+      if (legacy) html += '<p class="muted">' + esc(t("holdLegacy")) + '</p>';
+      html += '<dl>' + diagRow("diagRequest",info.request) + diagRow("diagTarget",info.target) + diagRow("diagConsumption",info.consumed ? t("diagConsumed") : t("holdNotConfirmed")) + diagRow("diagRecovery",info.recovered ? t("diagRecovered") : t("holdNotConfirmed")) + '</dl>';
+      if (!d) return html + '<p>' + esc(t("diagNoDispatch")) + '</p></div></details>';
+      const h = d.hold;
+      if (h) {
+        html += '<p class="muted">' + esc(t(held ? "autoHold" : "diagHistorical")) + '</p><dl>';
+        html += diagRow("diagOriginal",h.original_unavailable ? t("diagUnavailable") : diagEnum(h.cause)) + diagRow("diagSince",diagTime(!h.original_unavailable && h.since));
+        if (h.detail) html += diagRow("diagReason",h.detail);
+        if (h.original_unavailable) html += diagRow("diagAt",diagTime(h.since));
+        if (h.latest) html += diagRow(held ? "diagBlocker" : "diagRecordedBlocker",diagEnum(h.latest.reason)) + diagRow("diagReason",h.latest.detail) + diagRow("diagFirstSeen",diagTime(h.latest.first_at)) + diagRow("diagAt",diagTime(h.latest.at)) + diagRow("diagRepeats",diagNumber(h.latest,"repeats")) + diagRow("diagProgress",h.recovery_only ? t("diagRecoveryOnly") : diagNumber(h.latest,"stable_checks") + "/3") + diagRow(held ? "diagNext" : "diagRecordedNext",diagTime(h.latest.next_check_at));
+        html += '</dl>';
+      }
+      const a = d.authorization;
+      html += '<section><h4>' + esc(t("diagAuth")) + '</h4><dl>';
+      if (a) html += diagRow("diagAt",diagTime(a.at)) + diagRow("diagReason",diagEnum(a.reason)) + diagRow("diagExpiry",diagTime(a.target_expires_at)) + diagRow("diagPreCount",diagNumber(a,"pre_available")) + diagRow("diagUsed",a.pre_weekly_known ? diagNumber(a,"pre_weekly_used_pct") : t("diagUnavailable")) + diagRow("diagResetAt",diagTime(a.pre_weekly_reset_at)) + diagRow("diagWeeklyOpt",a.auto_weekly_exhaust) + diagRow("diagDefer",a.defer_near_recovery) + diagRow("diagGuard",a.recovery_guard) + diagRow("diagLimit",a.limit_to_expiry_window) + diagRow("diagWindow",a.expiry_usage_window) + diagRow("diagLead",a.trigger_lead);
+      else html += diagRow("diagAt",t("diagUnavailable"));
+      html += '</dl></section><section><h4>' + esc(t("diagDispatch")) + '</h4>';
+      const dispatches = Array.isArray(d.dispatches) ? d.dispatches.slice(0,6) : [];
+      if (!dispatches.length) html += '<p>' + esc(t("diagNoDispatch")) + '</p>';
+      dispatches.forEach(x => {
+        html += '<section class="dispatch-diag" data-dispatch-index="' + esc(diagNumber(x,"index")) + '"><dl>';
+        html += diagRow("diagIndex",diagNumber(x,"index")) + diagRow("diagIntent",diagTime(x.intent_at)) + diagRow("diagDelivery",diagEnum(x.delivery)) + diagRow("diagHTTP",x.http_status > 0 ? diagNumber(x,"http_status") : t("diagUnavailable"));
+        html += diagRow("diagAPI",x.api_code) + diagRow("diagWindows",diagNumber(x,"windows_reset")) + diagRow("diagElapsed",x.meta_unavailable ? t("diagUnavailable") : diagNumber(x,"elapsed_ms")) + diagRow("diagError",x.error_kind) + diagRow("diagDecision",diagEnum(x.decision)) + diagRow("diagRetry",diagTime(x.next_retry_at)) + '</dl></section>';
+      });
+      html += '</section>' + diagVerification(d.first_verify,"diagFirst",legacy) + diagVerification(d.latest_verify,"diagLatest",legacy);
+      if (d.operator_clear) html += '<p class="pill warn">' + esc(t("diagOverride")) + '</p><dl>' + diagRow("diagClearAt",diagTime(d.operator_clear.at)) + '</dl>';
+      return html + '</div></details>';
+    }
+    function compactDiagnosticHTML(rt, att) {
+      const d = att.diag, h = d && d.hold;
+      let html = '<div class="diag-compact">';
+      if (rt.auto_hold) {
+        html += '<strong>' + esc(t("autoHold")) + '</strong>';
+        html += '<span>' + esc(t("diagOriginal")) + ': ' + esc(h && !h.original_unavailable ? diagEnum(h.cause) : t("diagUnavailable")) + '</span>';
+        html += '<span>' + esc(t("diagSince")) + ': ' + esc(diagTime(h && !h.original_unavailable && h.since)) + '</span>';
+        html += '<span>' + esc(t("diagBlocker")) + ': ' + esc(h && h.latest ? diagEnum(h.latest.reason) : t("diagUnavailable")) + '</span>';
+        html += '<span>' + esc(t("diagProgress")) + ': ' + esc(h && h.recovery_only ? t("diagRecoveryOnly") : h && h.latest ? diagNumber(h.latest,"stable_checks") + "/3" : t("diagUnavailable")) + ' · ' + esc(t("diagNext")) + ': ' + esc(diagTime(rt.next_wake)) + '</span>';
+      } else if (d && d.operator_clear) html += '<span class="pill warn">' + esc(t("diagOverride")) + '</span>';
+      return html + '</div>';
+    }
+
+    function holdControlHTML(id, rt, att) {
+      let html = "";
+      if (rt.auto_hold) {
+        const d = att.diag || {}, v = d.latest_verify || {}, hold = d.hold || {};
+        const exact = (state.status.reset_history || []).find(r => att.redeem_request_id && r.auth_id === id && r.redeem_request_id === att.redeem_request_id) || {};
+        const shown = { id: id, requestId: typeof att.redeem_request_id === "string" ? att.redeem_request_id : "",
+          target: att.target_credit_id || "", cause: hold.original_unavailable ? "" : (hold.cause || ""),
+          detail: hold.detail || "", legacy: !att.diag || !!d.legacy_unavailable,
+          consumed: !!att.consumption_confirmed || v.consumption === "consumed" || !!exact.consumption_confirmed,
+          recovered: v.recovery === "recovered" || !!exact.recovery_confirmed || !!exact.success };
+        html += '<button class="mini secondary clear-hold-btn" data-auth="' + esc(id) + '" data-hold="' + esc(JSON.stringify(shown)) + '"' +
+          (clearPending[id] || state.authFailed ? ' disabled' : '') + '>' + esc(t(clearPending[id] ? "holdPending" : "clearHold")) + '</button>';
+      }
+      const feedback = clearFeedback[id];
+      if (feedback) {
+        html += '<span role="status" aria-live="polite" class="hold-feedback" data-hold-feedback="' + esc(id) + '">' + esc(t(feedback.key)) + '</span>';
+        if (feedback.refresh) html += '<button class="mini secondary hold-status-btn" data-auth="' + esc(id) + '">' + esc(t("holdRefresh")) + '</button>';
+      }
+      return html;
+    }
+
+    function holdConfirmation(shown) {
+      return [t("holdConfirm"), shown.id,
+        t("holdAttempt") + ": " + (shown.requestId || t("holdUnknown")),
+        t("holdTarget") + ": " + (shown.target || t("holdUnknown")),
+        t("holdCause") + ": " + (shown.cause ? shown.cause + (shown.detail ? " — " + shown.detail : "") : t("holdUnknown")),
+        t("consumption") + ": " + t(shown.consumed ? "holdConfirmed" : "holdNotConfirmed"),
+        t("recovery") + ": " + t(shown.recovered ? "holdConfirmed" : "holdNotConfirmed"),
+        shown.legacy ? t("holdLegacy") : "", t("holdRisk")].filter(Boolean).join("\n");
+    }
+
+    function holdErrorFeedback(e) {
+      if (e.status === 401 || e.status === 403 || e.message === "auth") return {key:"authRejected", refresh:false};
+      const keys = {ambiguous_history:"holdAmbiguous", busy:"holdBusy", active_operation:"holdActive",
+        stale_attempt:"holdStale", worker_unavailable:"holdUnavailable", worker_stopped:"holdUnavailable",
+        fsm_unavailable:"holdUnavailable", persistence_unavailable:"holdUnavailable", persistence_failed:"holdSaveFailed",
+        malformed_json:"holdInvalid", account_required:"holdInvalid", confirmation_required:"holdInvalid",
+        expected_identity_required:"holdInvalid", account_not_found:"holdInvalid", conflict:"holdStale"};
+      return {key:keys[e.reason] || "holdUncertain", refresh:e.reason !== "ambiguous_history"};
+    }
+
+    async function clearHold(button) {
+      const id = button.dataset.auth;
+      if (clearPending[id] || state.authFailed) return;
+      let shown;
+      try { shown = JSON.parse(button.dataset.hold); } catch (_) { return; }
+      if (shown.id !== id || typeof shown.requestId !== "string" || !confirm(holdConfirmation(shown))) return;
+      // Use the snapshot the operator actually confirmed, not a newer poll.
+      clearPending[id] = true;
+      button.disabled = true;
+      try {
+        const result = await apiSend("POST", "/clear-hold", {auth_index:id, confirm:true, expected_redeem_request_id:shown.requestId});
+        if (!result || typeof result !== "object" || !["cleared","already_clear"].includes(result.outcome)) {
+          clearFeedback[id] = {key:"holdUncertain", refresh:true};
+        } else {
+          clearFeedback[id] = {key:result.outcome === "cleared" ? "holdCleared" : "holdAlready", refresh:false};
+          await loadStatus(); // GET-only cached status; never check or redeem
+        }
+      } catch (e) {
+        clearFeedback[id] = holdErrorFeedback(e);
+      } finally {
+        delete clearPending[id];
+        renderAll();
+      }
+    }
+
+    async function readHoldStatus(id) {
+      try { await loadStatus(); }
+      catch (e) { clearFeedback[id] = {key:e.message === "auth" ? "authRejected" : "holdRefreshFailed", refresh:false}; renderAll(); }
+    }
+
     function unitSelectHTML(id, val, disabled, label) {
       return '<select id="' + id + '"' + (disabled ? ' disabled' : '') +
         (label ? ' aria-label="' + esc(label) + '"' : '') + '>' +
@@ -990,7 +1289,7 @@ func renderStatusHTML(state *PluginState) string {
         const badge = document.querySelector('[data-badge="' + esc(id) + '"]');
         if (badge) { badge.textContent = rt.state || "IDLE"; badge.className = "state-badge " + (rt.state || "IDLE"); }
         const meta = document.querySelector('[data-meta="' + esc(id) + '"]');
-        if (meta) meta.innerHTML = runtimeMetaHTML(rt, att, snap, hist);
+        if (meta) meta.innerHTML = runtimeMetaHTML(rt, att, snap, hist, id);
         return;
       }
       const weeklyTxt = (typeof snap.weekly_pct === "number" && snap.weekly_pct >= 0) ? snap.weekly_pct + "%" : "-";
@@ -1008,7 +1307,7 @@ func renderStatusHTML(state *PluginState) string {
           '<span class="acct-name">' + esc(accountLabel(a)) + '</span>' +
           '<span class="state-badge ' + esc(rt.state || "IDLE") + '" data-badge="' + esc(id) + '">' + esc(rt.state || "IDLE") + '</span>' +
         '</div>' +
-        '<div class="acct-meta" data-meta="' + esc(id) + '">' + runtimeMetaHTML(rt, att, snap, hist) + '</div>' +
+        '<div class="acct-meta" data-meta="' + esc(id) + '">' + runtimeMetaHTML(rt, att, snap, hist, id) + '</div>' +
         '<div class="policy-grid">' +
           '<div class="policy-cell"><label>' + t("patrolLbl") + '</label>' +
             durEditorHTML("p_" + id, eff.refresh_interval || "1h", ov.refresh_interval, ovCfg.refresh_interval) + '</div>' +
@@ -1051,7 +1350,7 @@ func renderStatusHTML(state *PluginState) string {
       return row;
     }
 
-    function runtimeMetaHTML(rt, att, snap, hist) {
+    function runtimeMetaHTML(rt, att, snap, hist, id) {
       const weeklyTxt = (typeof snap.weekly_pct === "number" && snap.weekly_pct >= 0) ? snap.weekly_pct + "%" : "-";
       let meta = '<span>' + t("creditsAvail") + ': ' + esc(String(snap.available_count == null ? "-" : snap.available_count)) +
         ' · ' + t("weeklyRemain") + ': ' + esc(weeklyTxt) +
@@ -1075,7 +1374,10 @@ func renderStatusHTML(state *PluginState) string {
       if (rt.auto_hold) {
         meta += '<span class="pill warn">' + t("autoHold") + '</span>';
       }
-      return meta;
+      let diagnostics = compactDiagnosticHTML(rt, att);
+      if (att.redeem_request_id || att.diag || rt.auto_hold) diagnostics += diagnosticHTML(att.diag, {request:att.redeem_request_id, target:att.target_credit_id, consumed:!!att.consumption_confirmed, recovered:att.diag && att.diag.latest_verify && att.diag.latest_verify.recovery === "recovered"}, "current|" + id + "|" + (att.redeem_request_id || "legacy"), "current", !!rt.auto_hold);
+      hist.forEach((r,i) => { diagnostics += diagnosticHTML(r.diag, {request:r.redeem_request_id, target:r.credit_id, consumed:!!r.consumption_confirmed, recovered:!!r.recovery_confirmed}, "history|" + id + "|" + (r.redeem_request_id || r.timestamp || i), "history", false); });
+      return meta + diagnostics + holdControlHTML(id, rt, att);
     }
 
     function renderGroups() {
@@ -1131,6 +1433,24 @@ func renderStatusHTML(state *PluginState) string {
         '<div class="stat"><div class="k">' + esc(t("total")) + '</div><div class="v">' + hist.length + '</div></div>';
     }
 
+    function logDiagnosticHTML(e) {
+      const d = e.details || {}, key = "log|" + (e.scope || "") + "|" + (e.timestamp || "") + "|" + (d.phase || "") + "|" + (d.redeem_request_id || "") + "|" + (d.dispatch_index == null ? "" : d.dispatch_index);
+      if (!d.phase && !d.redeem_request_id) return "";
+      let html = '<details class="diagnostic-details log-diagnostic" data-diag-key="' + esc(key) + '" data-diag-kind="log"' + (diagExpanded[key] ? ' open' : '') + '><summary>' + esc(t("diagLog")) + '</summary><dl>' + diagRow("diagAt",diagTime(d.observed_at || e.timestamp));
+      const fields = [["diagRequest","redeem_request_id"],["diagTarget","credit_id"],["diagKind","phase"],["diagReason","block_reason"],["diagOriginal","hold_cause"],["diagDelivery","delivery"],["diagHTTP","http_status"],["diagAPI","api_code"],["diagWindows","windows_reset"],["diagElapsed","elapsed_ms"],["diagError","error_kind"],["diagDecision","decision"],["diagIndex","dispatch_index"],["diagUsed","post_weekly_used_pct"],["diagUsed","weekly_used_pct"],["diagProgress","stable_checks"],["diagConsumption","target_status"],["diagRecovery","recovery"]];
+      fields.forEach(pair => {
+        const label = pair[0], field = pair[1];
+        if (!Object.prototype.hasOwnProperty.call(d,field)) return;
+        let value = d[field];
+        if (field === "http_status") value = value > 0 ? diagNumber(d,field) : t("diagUnavailable");
+        else if (field === "elapsed_ms") value = d.meta_unavailable ? t("diagUnavailable") : diagNumber(d,field);
+        else if (["windows_reset","dispatch_index","post_weekly_used_pct","weekly_used_pct","stable_checks"].includes(field)) value = diagNumber(d,field);
+        else if (["phase","block_reason","hold_cause","delivery","decision","target_status","recovery"].includes(field)) value = diagEnum(value);
+        html += diagRow(label,value);
+      });
+      return html + '</dl></details>';
+    }
+
     function renderLogs() {
       const box = document.getElementById("logs");
       const list = state.logs || [];
@@ -1139,11 +1459,20 @@ func renderStatusHTML(state *PluginState) string {
         '<div class="line"><span class="ts">[' + esc(fmtTime(e.timestamp)) + ']</span> ' +
         '<span class="lvl-' + esc(e.level || "info") + '">' + esc((e.level || "info").toUpperCase()) + '</span> ' +
         '<span class="muted">[' + esc(e.scope || "") + '/' + esc(e.state || "") + ']</span> ' +
-        esc(e.message || "") + '</div>').join("");
+        esc(e.message || "") + logDiagnosticHTML(e) + '</div>').join("");
     }
 
     function renderAll() {
+      const active = document.activeElement;
+      const focused = active && active.tagName === "SUMMARY" && active.parentElement && active.parentElement.dataset.diagKey;
+      const expanded = Object.create(null);
+      document.querySelectorAll('details[data-diag-key]').forEach(el => { expanded[el.dataset.diagKey] = el.open; });
+      diagExpanded = expanded;
       renderGlobal(); renderGroups(); renderStats(); renderLogs();
+      if (focused) {
+        const detail = Array.from(document.querySelectorAll('details[data-diag-key]')).find(el => el.dataset.diagKey === focused);
+        if (detail) detail.querySelector('summary').focus();
+      }
       const lu = document.getElementById("lastUpdated");
       lu.textContent = state.lastUpdated ? t("lastUpdated") + " " + state.lastUpdated.toLocaleTimeString() : "";
     }
@@ -1356,6 +1685,8 @@ func renderStatusHTML(state *PluginState) string {
         if (b.classList.contains("move-btn")) { moveAccount(id, b.dataset.dir === "on"); return; }
         if (b.classList.contains("save-row")) { saveRow(id); return; }
         if (b.classList.contains("restore-btn")) { restoreDefaults(id); return; }
+        if (b.classList.contains("clear-hold-btn")) { clearHold(b); return; }
+        if (b.classList.contains("hold-status-btn")) { readHoldStatus(id); return; }
         if (b.classList.contains("check-btn")) { checkOne(id); return; }
         if (b.classList.contains("reset-btn")) { resetOne(id); return; }
       });

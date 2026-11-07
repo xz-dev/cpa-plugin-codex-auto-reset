@@ -28,7 +28,7 @@ var openAIDefaultHTTP = &http.Client{Timeout: 30 * time.Second}
 
 // HTTPStatusError carries the status code of a non-2xx response so callers
 // (notably the retry classifier in retry.go) can distinguish 4xx (hard stop)
-// from 5xx (retry). Body is included for diagnostics/logging.
+// from 5xx (retry). Body is retained for callers, never for logging/persistence.
 type HTTPStatusError struct {
 	Method string
 	Path   string
@@ -61,27 +61,41 @@ func (c *OpenAIClient) httpClient() *http.Client {
 	return openAIDefaultHTTP
 }
 
-func (c *OpenAIClient) do(req *http.Request) ([]byte, error) {
+// do performs one HTTP call and also returns safe transport metadata (status,
+// elapsed time, error category). Errors and their retry classification are
+// unchanged; meta never carries headers, bodies or credentials.
+func (c *OpenAIClient) do(req *http.Request) ([]byte, ResponseMeta, error) {
+	start := time.Now()
+	meta := ResponseMeta{Sent: true}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, err
+		meta.Elapsed = time.Since(start)
+		meta.ErrorKind = errKind(err)
+		if meta.ErrorKind == "unclassified" {
+			meta.ErrorKind = "transport"
+		}
+		return nil, meta, err
 	}
 	defer resp.Body.Close()
+	meta.HTTPStatus = resp.StatusCode
 	// 1 MiB cap; the largest legitimate response from these endpoints is well
 	// under 2 KiB. A larger body signals a buggy or hostile server.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	meta.Elapsed = time.Since(start)
 	if err != nil {
-		return nil, err
+		meta.ErrorKind = "body_read"
+		return nil, meta, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, &HTTPStatusError{
+		meta.ErrorKind = httpKind(resp.StatusCode)
+		return body, meta, &HTTPStatusError{
 			Method: req.Method,
 			Path:   req.URL.Path,
 			Code:   resp.StatusCode,
 			Body:   body,
 		}
 	}
-	return body, nil
+	return body, meta, nil
 }
 
 func (c *OpenAIClient) setAuthHeaders(req *http.Request, creds CodexCredentials) {
@@ -115,7 +129,7 @@ func (c *OpenAIClient) fetchCredits(creds CodexCredentials, now time.Time, unfil
 	}
 	c.setAuthHeaders(req, creds)
 	req.Header.Set("Accept", "application/json")
-	body, err := c.do(req)
+	body, _, err := c.do(req)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -131,7 +145,7 @@ func (c *OpenAIClient) GetUsage(creds CodexCredentials) (Snapshot, error) {
 	}
 	c.setAuthHeaders(req, creds)
 	req.Header.Set("Accept", "application/json")
-	body, err := c.do(req)
+	body, _, err := c.do(req)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -151,7 +165,8 @@ func (c *OpenAIClient) GetUsage(creds CodexCredentials) (Snapshot, error) {
 // calling.
 func (c *OpenAIClient) Consume(creds CodexCredentials, redeemRequestID, creditID string) (ConsumeResponse, error) {
 	if redeemRequestID == "" || creditID == "" {
-		return ConsumeResponse{}, errors.New("consume: redeem_request_id and credit_id are both required (empty defeats §2.1 safety)")
+		return ConsumeResponse{Meta: ResponseMeta{ErrorKind: "request_invalid"}},
+			errors.New("consume: redeem_request_id and credit_id are both required (empty defeats §2.1 safety)")
 	}
 	u := c.baseURL() + consumeEndpointPath
 	payload := struct {
@@ -160,19 +175,24 @@ func (c *OpenAIClient) Consume(creds CodexCredentials, redeemRequestID, creditID
 	}{RedeemRequestID: redeemRequestID, CreditID: creditID}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return ConsumeResponse{}, err
+		return ConsumeResponse{Meta: ResponseMeta{ErrorKind: "request_invalid"}}, err
 	}
 	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(raw))
 	if err != nil {
-		return ConsumeResponse{}, err
+		return ConsumeResponse{Meta: ResponseMeta{ErrorKind: "request_invalid"}}, err
 	}
 	c.setAuthHeaders(req, creds)
 	req.Header.Set("Content-Type", "application/json")
-	body, err := c.do(req)
+	body, meta, err := c.do(req)
 	if err != nil {
-		return ConsumeResponse{}, err
+		return ConsumeResponse{Meta: meta}, err
 	}
-	return parseConsumeResponse(body)
+	resp, err := parseConsumeResponse(body)
+	if err != nil {
+		meta.ErrorKind = "parse"
+	}
+	resp.Meta = meta
+	return resp, err
 }
 
 // Endpoint paths are constants relative to BaseURL. The production BaseURL is

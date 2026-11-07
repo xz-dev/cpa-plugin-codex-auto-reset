@@ -17,12 +17,12 @@ type CredsLoader func(authID string) (CodexCredentials, ResetClient, error)
 // that account, and recomputes. Manual triggers (TriggerCheck, ForceConfirm)
 // wake the loop early.
 //
-// Concurrency contract: the worker goroutine owns the FSM structs after init.
-// EachFSM, TriggerCheck, ForceConfirm, and Stop are safe to call concurrently
-// from other goroutines (management handlers); they take the worker mutex and
-// only read/snapshot FSM fields. Reading an FSM's State()/NextWake() from
-// another goroutine may observe a stale value, which is harmless (the next
-// poll reconciles).
+// Concurrency contract: a worker tick owns stepMu through StateSync. ClearHold
+// try-locks stepMu -> Worker.mu -> FSM.mu before its state transaction. State
+// persistence may then take pluginStateMu, but must never call back into an
+// FSM/Worker. Management must enter without holding pluginStateMu. Existing
+// management signals retain their registry/FSM locks; snapshot readers may
+// observe a stale value until the next poll.
 type Worker struct {
 	cfg     Config
 	enabled []string
@@ -35,6 +35,9 @@ type Worker struct {
 	// from the worker goroutine.
 	StateSync func(authID string, fsm *AccountFSM)
 
+	// stepMu spans a worker tick through its StateSync callback. Manual clear
+	// try-locks it so an older tick cannot republish a hold after clearing.
+	stepMu  sync.Mutex
 	mu      sync.Mutex
 	fsms    map[string]*AccountFSM
 	logs    *logRing
@@ -63,6 +66,14 @@ type Worker struct {
 	// PersistAttempt, when non-nil, synchronously persists a new attempt's
 	// identity before its first consume. Wired by main.go into every FSM.
 	PersistAttempt func(authID string, a ResetAttempt) error
+
+	// Checkpoint, when non-nil, synchronously persists an attempt snapshot
+	// under the given phase (for example dispatch intent). Unlike
+	// PersistAttempt it never blocks spending. Wired into every FSM.
+	Checkpoint func(authID string, phase State, a ResetAttempt) error
+	// PersistHoldClear receives immutable candidate values and must save
+	// before publishing. It must not call into the Worker/FSM or host APIs.
+	PersistHoldClear func(authID string, rt AccountRuntime, pending *ResetRecord, entry LogEntry) error
 
 	// hints holds coalesced weekly-exhaustion wake-ups under its own short
 	// mutex. usage.handle only touches this set — never w.mu (Reconcile can
@@ -368,6 +379,8 @@ func (w *Worker) Run() {
 // worker goroutine survives. On panic, the account gets nextWake pushed
 // forward by refresh_interval and an error log is recorded.
 func (w *Worker) stepAccountSafe(authID string) {
+	w.stepMu.Lock()
+	defer w.stepMu.Unlock() // panic cleanup and StateSync complete before clear
 	defer func() {
 		if r := recover(); r != nil {
 			w.logs.append(LogEntry{
@@ -465,6 +478,10 @@ func (w *Worker) ensureFSM(id string) {
 	if w.PersistAttempt != nil {
 		persist := w.PersistAttempt
 		fsm.PersistAttempt = func(a ResetAttempt) error { return persist(id, a) }
+	}
+	if w.Checkpoint != nil {
+		cp := w.Checkpoint
+		fsm.Checkpoint = func(phase State, a ResetAttempt) error { return cp(id, phase, a) }
 	}
 	// Restore a persisted in-flight attempt so an uncertain pre-restart
 	// outcome reconciles conservatively instead of becoming a fresh consume.

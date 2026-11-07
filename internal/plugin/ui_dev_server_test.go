@@ -31,7 +31,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -79,8 +81,26 @@ func TestUIDevServer(t *testing.T) {
 	for i := 0; i < 20 && !fsm.StepAndSettle().After(time.Now()); i++ {
 	}
 	state.Accounts["acct-a"] = AccountRuntime{AuthID: "acct-a", State: fsm.State(), NextWake: fsm.NextWake(), LastSnapshot: fsm.LastSnapshot()}
+	var holdCounters *uiHoldCounters
+	var e2e *uiHoldE2E
+	if os.Getenv("CODEX_AUTO_RESET_UI_HOLD_FIXTURES") == "1" {
+		holdCounters = seedHoldUIFixtures(t, h, w, now)
+		if os.Getenv("CODEX_AUTO_RESET_UI_DIAG_FIXTURES") == "1" {
+			seedDiagnosticUIFixtures(t, h, w, now)
+		}
+		if os.Getenv("CODEX_AUTO_RESET_UI_E2E_FIXTURES") == "1" {
+			e2e = newUIHoldE2E(t, h, w, holdCounters, now)
+		}
+	}
 	h.worker = w
+	var fixtureMu sync.Mutex
 	serve := func(w http.ResponseWriter, r *http.Request, prefix string) {
+		// E2E workers are never run; serialize only this optional test mode's
+		// HTTP reads/mutations with its explicit fixture rotation/restart.
+		if e2e != nil {
+			fixtureMu.Lock()
+			defer fixtureMu.Unlock()
+		}
 		path := r.URL.Path
 		if prefix != "" {
 			if !strings.HasPrefix(path, prefix) {
@@ -95,6 +115,17 @@ func TestUIDevServer(t *testing.T) {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
+		if e2e != nil {
+			w.Header().Set("X-UI-Fixture-Generation", strconv.Itoa(e2e.generation))
+			if e2e.serve(w, r, path) {
+				return
+			}
+		}
+		if holdCounters != nil && path == "/__test__/counters" && r.Method == http.MethodGet {
+			holdCounters.serve(w, h.worker)
+			return
+		}
+		holdCounters.record(r.Method, path)
 		status, body, ct := h.handle(r.Method, path, r.Header, mustReadBody(r))
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(status)

@@ -30,11 +30,11 @@ func (r *logRing) load(entries []LogEntry) {
 	if len(entries) > r.cap {
 		entries = entries[len(entries)-r.cap:]
 	}
-	r.entries = make([]LogEntry, len(entries))
-	copy(r.entries, entries)
+	r.entries = redactLogEntries(entries) // legacy logs obey the same boundary
 }
 
 func (r *logRing) append(e LogEntry) {
+	e = redactEntry(e) // credentials never enter the ring, state, export or UI
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries = append(r.entries, e)
@@ -47,8 +47,10 @@ func (r *logRing) append(e LogEntry) {
 func (r *logRing) all() []LogEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]LogEntry, len(r.entries))
-	copy(out, r.entries)
+	out := redactLogEntries(r.entries)
+	if out == nil {
+		return []LogEntry{}
+	}
 	return out
 }
 

@@ -22,6 +22,11 @@ const (
 type ConsumeResponse struct {
 	Code         ConsumeCode `json:"code"`
 	WindowsReset int         `json:"windows_reset"`
+	// HasWindowsReset reports whether upstream returned windows_reset.
+	HasWindowsReset bool `json:"-"`
+	// Meta is safe transport evidence set by OpenAIClient (zero from fakes:
+	// unavailable). Not part of the wire format.
+	Meta ResponseMeta `json:"-"`
 }
 
 // rawCredit captures only the fields we use from one row of the
@@ -281,5 +286,10 @@ func parseConsumeResponse(raw []byte) (ConsumeResponse, error) {
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return ConsumeResponse{}, fmt.Errorf("parse consume response: %w", err)
 	}
+	var probe struct {
+		W *int `json:"windows_reset"`
+	}
+	_ = json.Unmarshal(raw, &probe)
+	resp.HasWindowsReset = probe.W != nil
 	return resp, nil
 }
