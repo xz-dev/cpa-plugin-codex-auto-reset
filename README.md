@@ -22,7 +22,9 @@ The plugin runs inside CPA as a dynamic library. It reads Codex credentials thro
 - **Natural-recovery deferral (opt-in).** Skips a weekly-exhaustion redemption when the same weekly window will recover on its own within a set window (default 24h, boundary inclusive), so a credit is not spent on quota that is about to return anyway. An expiry trigger still wins. If upstream gives no trustworthy recovery time, the plain exhaustion rule applies.
 - **Verified consumption.** After a redeem the plugin re-reads the credit list. The credit counts as consumed only if that same credit ID is gone, or is listed as `redeemed`/`consumed`/`used` or with a `redeemed_at` time. Success also requires the available count to drop by one and the weekly quota to recover. Transient errors are retried with the same idempotency key, so a retry cannot redeem twice.
 - **Automatic-spending hold.** Any unclear outcome stops automatic redemption for that account. Patrols continue read-only and never make a compensating redemption. The hold clears by itself after 3 consecutive stable read-only checks, each more than 30 minutes apart, or when a redemption that already used its credit sees the account's quota come back.
-- **Manual control.** **Check now** runs an immediate read-only patrol. **Redeem now** redeems the soonest-expiring credit after confirmation; it bypasses deferral and the usage window and is the manual way out of a hold.
+- **Manual control.** **Check now** requests an immediate check under normal policy and can lead to automatic redemption. **Redeem now** explicitly redeems the soonest-expiring credit after confirmation, bypassing deferral and the usage window.
+- **Clear a hold without redeeming.** **Clear hold** confirms and clears the displayed held attempt without querying upstream, requesting a check, or clearing routing cooldown. Later normal automation can still spend credits. Busy, stale, or ambiguous legacy evidence is rejected instead of guessed.
+- **Retained diagnostics.** Expand account, history, and log details to follow the request identity, dispatch/response or unknown delivery, verification evidence, original hold cause, latest blocker, and operator clearing. Missing legacy evidence stays unavailable; a successful response is not proof of credit consumption or quota recovery.
 - **History and logs.** Every redemption is recorded in a reset-statistics panel. Recent log entries (up to 1000, kept 7 days) appear on the page.
 - **Durable state.** Settings, per-account state, history and logs survive CPA restarts and container recreates. The state file holds no tokens, keeps a backup copy, and quarantines a corrupt file instead of overwriting it.
 - **Export and import.** The management API exports the plugin state as JSON and imports it again. Import restores settings and history, never runtime holds.
@@ -62,7 +64,7 @@ First sign in to the Management Center with "remember password" checked. The pag
 2. Move the accounts you want into the enabled list.
 3. Override per-account values where needed and save each row.
 
-The page refreshes saved status every 15 seconds.
+The page refreshes saved status every 15 seconds. For a held account, inspect **Request diagnostics** before selecting **Clear hold**. Clearing is an operator override, not a successful reset or proof that the earlier upstream problem is fixed; it does not save unrelated drafts. See [hold clearing and diagnostics](docs/reference.md#clear-a-hold-without-redeeming) for the API, conflict cases, retention, and private forensic-file exception.
 
 Settings can also be given in the plugin's `config_yaml`; values saved from the page take precedence:
 

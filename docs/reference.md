@@ -77,9 +77,9 @@ The plugin persists one state file — the user config fields, per-account FSM s
 2. `<CPA auth dir>/plugin-state/codex-auto-reset/state.data` — derived from the auth file paths reported by the host. The name deliberately does not end in `.json`: CPA walks the auth dir recursively and loads every `*.json` as an auth file, which is why versions up to 0.1.13 showed `plugin-state/codex-auto-reset/state` in the Management Center auth-file list. An old `state.json` there is migrated once and kept as `state.json.migrated`. **Recommended and default**: in container deployments the auth dir is the tree operators volume-mount, so state survives CPA image updates and container recreates.
 3. `<OS user config dir>/CLIProxyAPI/codex-auto-reset/state.json` — fallback (Windows `%APPDATA%`, Linux `~/.config`). **Ephemeral inside containers** unless that path is volume-mounted.
 
-The plugin also keeps a one-generation backup (`<state>.bak`, refreshed on every successful load) and, if the main file is ever corrupt, quarantines the original bytes as `<state>.corrupt-<timestamp>` before recovering from the backup — state is never silently destroyed.
+The plugin also keeps a one-generation backup (`<state>.bak`, refreshed on every successful load). Valid backup refreshes sanitize diagnostic log entries while preserving unrelated raw JSON fields, including unknown fields. If the main file is corrupt, the existing recovery mechanism keeps its original bytes as `<state>.corrupt-<timestamp>` before recovering from backup; state is not silently destroyed.
 
-Docker note: with the default auth-dir location, mounting your auth dir (you already must, for credentials) is enough, e.g. `-v ./cpa/auths:/root/.cli-proxy-api`. No access tokens or credential material are persisted in the state file.
+Docker note: with the default auth-dir location, mounting your auth dir (you already must, for credentials) is enough, e.g. `-v ./cpa/auths:/root/.cli-proxy-api`. Newly written diagnostic records do not persist access tokens, management keys, headers, proxy credentials, or raw upstream bodies. **Private forensic exception:** corrupt-state originals are deliberately byte-for-byte and may contain legacy sensitive data. They retain restricted access (0600 on POSIX; existing platform ACL behavior elsewhere), are never served by status/logs/UI/export, and are not automatically rewritten or deleted. Do not attach them to public reports. This is not an all-disk secret-removal guarantee.
 
 ## Management API
 
@@ -93,11 +93,72 @@ PUT  /v0/management/plugins/codex-auto-reset/settings        # update config fie
 POST /v0/management/plugins/codex-auto-reset/check           # manual check; body {auth_index}
 POST /v0/management/plugins/codex-auto-reset/check/all       # manual check all accounts
 POST /v0/management/plugins/codex-auto-reset/reset           # manual reset; body {auth_index}
+POST /v0/management/plugins/codex-auto-reset/clear-hold      # confirmed hold override; body below
 GET  /v0/management/plugins/codex-auto-reset/export          # export state JSON
 POST /v0/management/plugins/codex-auto-reset/import          # import state JSON
 ```
 
 All `/v0/management/...` routes require the CPA Management key.
+
+## Clear a Hold Without Redeeming
+
+Use **Clear hold** only after reviewing the displayed held attempt. This action is separate from **Check now** and **Redeem now**:
+
+- It sends no upstream credit/usage request, requests no check, schedules no redemption wake, and does not clear CPA routing cooldown.
+- It does not change account enablement, policies, unrelated settings drafts, prior consumption evidence, or a failed reset into a successful one.
+- **Later independently scheduled checks or existing signals can still redeem under normal policy.** Clearing does not grant manual early-redemption authority or a permanent spending pause.
+- It does not repair or explain a previously unknown upstream failure. Existing automatic hold-release criteria, expiry priority, the credit-usage window, and weekly-recovery behavior remain unchanged.
+
+The management-only POST inherits CPA Management authentication. First read cached `GET /status` and use the held account's current `attempt.redeem_request_id`. The confirmation refers to that displayed attempt, not any convenient older history row.
+
+Example request body (replace both placeholders with the current account and held identity):
+
+```json
+{
+  "auth_index": "<account-auth-index>",
+  "confirm": true,
+  "expected_redeem_request_id": "<current-held-request-id>"
+}
+```
+
+`expected_redeem_request_id` must be a **present string**. For an actual legacy hold whose current identity is empty, explicitly send `""`; empty is not a wildcard. Missing, null, wrong-type or unconfirmed input is rejected. Do not erase a nonempty identity to force a clear.
+
+The configured endpoint returns stable `error`/`reason` fields rather than raw persistence errors:
+
+| HTTP | Result | Meaning |
+| --- | --- | --- |
+| 200 | `outcome: cleared` or `already_clear` | Explicit `cleared` / `already_clear` booleans; not a reset-success claim. |
+| 400 | `invalid_request` | `malformed_json`, `account_required`, `confirmation_required`, or `expected_identity_required`; a `field` is supplied when known. |
+| 404 | `account_not_found` | No such cached account; nothing is enabled or constructed. |
+| 409 | `hold_clear_conflict` | `busy`, `active_operation`, `stale_attempt`, or `ambiguous_history` (a conservative generic `conflict` is also possible for an untyped custom cause); protection remains in place. |
+| 503 | `hold_clear_unavailable` | `worker_unavailable`, `worker_stopped`, `fsm_unavailable`, or `persistence_unavailable`; no false success. |
+| 500 | `hold_clear_persistence_failed` | `persistence_failed`; the live hold remains active. |
+
+A missing, invalid, or unrecognized acknowledgment leaves the action's result **unknown**: the server may already have saved the clear. Do not infer that the hold stayed active, and do not automatically resend the mutation. Use GET-only saved-status confirmation. This differs from the configured endpoint's explicit `persistence_failed` response, which confirms that saving failed and the live hold remained protected.
+
+CPA can also reject authentication or plugin availability before this endpoint is reached. A busy worker tick includes its state synchronization; a clear is not queued behind it. For stale state, use a passive status refresh and confirm again. **Ambiguous legacy history requires evidence review, not blind refreshing/retrying:** exact request matches and unique legacy associations work, but several plausible old rows are never guessed or duplicated as consumed cards. The UI does not automatically retry mutations. No active confirmation, consume, retry or verification is discarded.
+
+A successful clear persists the operator override before publishing the cleared state. It survives restart without rearming the overridden old reconciliation. Prior outcome/history remains available; a new later cycle has its own request identity and normal authority. Merely reading status, logs, history or diagnostic details never queries upstream.
+
+## Attempt Diagnostics And Recovery Artifacts
+
+Current attempts expose optional `attempt.diag`; retained history exposes `reset_history[].diag` and `redeem_request_id`. Structured log details use the same account/request/target correlation. Expand **Request diagnostics** in either UI language to inspect:
+
+| Evidence | Interpretation |
+| --- | --- |
+| `authorization` | Original reason, target/expiry, effective policy, and quota/count observation. |
+| `dispatches` | Bounded recorded invocation observations: intent, response or uncertain delivery, HTTP/API result, optional window count/timing, retry index and next retry. |
+| `first_verify` / `latest_verify` | Initial and latest query facts, observation times, target status/absence, expiry ambiguity, counts, known unrounded weekly usage, and separate consumption/recovery conclusions. |
+| `hold` | Original cause/time when known, latest blocker, repeats, stable-read progress and next saved check. |
+| `operator_clear` | An explicit operator override and timestamp, not evidence of quota recovery or another consumed credit. |
+
+Dispatch intent is not proof of upstream receipt. A timeout leaves delivery uncertain; retry index 0 can coexist with a real first invocation. An accepted response is not proof of consumption, and consumption is not proof of weekly recovery. Known HTTP status remains visible even if other metadata is missing. Explicit `windows_reset: 0` differs from absent/null evidence; missing timing/status/timestamps are not replaced with invented zeroes or current time. The UI shows local zoned times alongside recorded ISO values where available.
+
+Legacy summaries use `legacy_unavailable` and unavailable labels. Missing structured evidence does not mean an event never happened, and a later read-only observation is not relabeled as the original hold onset. Old generic success flags do not manufacture missing recovery evidence. Older free-form English log text is not retroactively translated; new phase/reason labels are bilingual.
+
+The ordinary log ring remains capped at **1,000 entries / seven days**. A current held attempt's essential summary survives log overflow/pruning and restart; repeated observations update bounded latest evidence. Historical summaries live with the existing **500-record** history bound. Audit updates use the exact account/request identity and do not count operator actions as new card consumption. New diagnostic fields are additive, so upgrades preserve existing holds; no account is automatically cleared. Older binaries can ignore/drop these fields when saving after downgrade, so keep a state backup before downgrading.
+
+Diagnostic fields are bounded and allowlisted; tokens, management keys, authorization/cookie headers, proxy credentials and raw upstream bodies are not stored or displayed as diagnostic evidence. The private corrupt-file forensic exception is described under [State Storage And Durability](#state-storage-and-durability); normal valid-backup log refresh and private raw quarantine are intentionally different.
 
 ## GitHub Releases
 
@@ -117,7 +178,7 @@ checksums.txt
 
 ## Manual Verification Checklist
 
-Before relying on this plugin in production, verify against real OpenAI:
+Use fake-client tests and the env-gated UI harness for routine acceptance. The checklist below contains **optional, credit-consuming live checks**: run those only with separate explicit operator authorization to spend a real credit. They are not required to clear a hold or inspect diagnostics.
 
 - [ ] The resource page renders after Management Center saved sign-in and the language switcher works; a missing/mismatched saved login shows guidance instead.
 - [ ] Moving an account between the enabled/disabled groups persists, and per-account overrides save/restore independently per field.
